@@ -23,15 +23,15 @@ local CONFIG = {
   FIELD_TARGET_OPTIONS = { 0.45, 0.50, 0.55, 0.60 },
   DEFAULT_FIELD_TARGET = 0.50,
 
-  CHARGE_INFLOW = 150000000,
-  STARTUP_PRIME_INPUT = 300000000,
-  STARTUP_HOLD_SECONDS = 24,
+  CHARGE_INFLOW = 200000000,
+  STARTUP_PRIME_INPUT = 360000000,
+  STARTUP_HOLD_SECONDS = 30,
   RAMP_SECONDS = 300,
-  RAMP_START_FIELD = 0.82,
-  RAMP_START_SAT = 0.88,
+  RAMP_START_FIELD = 0.70,
+  RAMP_START_SAT = 0.75,
 
-  ACTIVATE_MIN_FIELD = 0.98,
-  ACTIVATE_MIN_SAT = 0.98,
+  ACTIVATE_MIN_FIELD = 0.48,
+  ACTIVATE_MIN_SAT = 0.48,
 
   SCRAM_TEMP = 8650,
   SCRAM_FIELD = 0.22,
@@ -467,7 +467,9 @@ end
 
 local function reactorIsChargedEnough(info)
   if not info then return false end
-  return info.status == "charged" or (info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD and info.satPct >= CONFIG.ACTIVATE_MIN_SAT)
+  return info.status == "charged"
+    or info.status == "starting"
+    or (info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD and info.satPct >= CONFIG.ACTIVATE_MIN_SAT)
 end
 
 local function shouldScram(info)
@@ -589,6 +591,13 @@ local function updateRunning(info, dt)
     if now() < (state.holdUntil or 0) then
       local startupField = math.max(fieldTarget, CONFIG.RAMP_START_FIELD)
       local startupInput = math.max(calcFieldFeedForward(info, startupField), CONFIG.STARTUP_PRIME_INPUT)
+
+      if info.fieldPct < 0.35 then
+        startupInput = CONFIG.MAX_INPUT
+      elseif info.fieldPct < 0.50 then
+        startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT)
+      end
+
       setFlows(startupInput, 0)
       return
     else
@@ -821,8 +830,7 @@ local function doStart()
   local info = state.lastInfo
 
   if not reactorIsChargedEnough(info) then
-    pushLog("Start blocked: reactor not fully charged")
-    state.mode = "CHARGING"
+    pushLog("Start blocked: reactor not charged enough")
     return
   end
 
