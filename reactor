@@ -32,6 +32,9 @@ local CONFIG = {
   STARTUP_HOLD_SECONDS = 32,
   STARTUP_SCRAM_GRACE_SECONDS = 12,
   STARTUP_MIN_FIELD_FOR_ARM = 0.28,
+  STARTUP_READY_FIELD = 0.48,
+  STARTUP_READY_SAT = 0.48,
+
   RAMP_SECONDS = 300,
   RAMP_START_FIELD = 0.58,
   RAMP_START_SAT = 0.78,
@@ -474,11 +477,10 @@ local function getSoftFieldLow()
   return math.max(0.38, state.targetField - 0.06)
 end
 
-local function reactorIsChargedEnough(info)
+local function reactorIsChargeReady(info)
   if not info then return false end
-  return info.status == "charged"
-    or info.status == "starting"
-    or (info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD and info.satPct >= CONFIG.ACTIVATE_MIN_SAT)
+  return info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD
+     and info.satPct >= CONFIG.ACTIVATE_MIN_SAT
 end
 
 local function inStartupGrace()
@@ -550,7 +552,7 @@ local function updateCharging(info)
   state.scramArmed = false
   setFlows(CONFIG.CHARGE_INFLOW, 0)
 
-  if info.status == "cold" or info.fieldPct < CONFIG.ACTIVATE_MIN_FIELD or info.satPct < CONFIG.ACTIVATE_MIN_SAT then
+  if not reactorIsChargeReady(info) then
     if (now() - (state.lastChargeAttempt or 0)) >= CONFIG.CHARGE_RETRY_SECONDS then
       local ok, err = callReactor("charge")
       state.lastChargeAttempt = now()
@@ -561,25 +563,12 @@ local function updateCharging(info)
         pushLog("Charge retry failed: " .. tostring(err))
       end
     end
+    return
   end
 
-  if reactorIsChargedEnough(info) then
-    state.mode = "STARTING"
-    state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
-    state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
-    state.startupGraceUntil = now() + CONFIG.STARTUP_SCRAM_GRACE_SECONDS
-    state.rampStart = now()
-    state.scramArmed = false
-
-    setFlows(CONFIG.STARTUP_PUNCH_INPUT, 0)
-
-    local ok, err = callReactor("activate")
-    if ok then
-      pushLog("Activation requested")
-    else
-      pushLog("Activation failed: " .. tostring(err))
-    end
-  end
+  setFlows(0, 0)
+  state.mode = "IDLE"
+  pushLog("Charge complete - press Start")
 end
 
 local function updateStopping(info)
@@ -799,6 +788,7 @@ local function drawUI()
   if state.mode == "SCRAM" then modeColor = colors.red end
   if state.mode == "STOPPING" then modeColor = colors.orange end
   if state.mode == "STARTING" then modeColor = colors.orange end
+  if state.mode == "CHARGING" then modeColor = colors.cyan end
 
   writeAt(2, 3, "Mode: ", colors.lightGray)
   writeAt(8, 3, state.mode, modeColor)
@@ -840,6 +830,8 @@ local function drawUI()
     writeAt(2, 21, "SCRAM reason: " .. state.scramReason, colors.red)
   elseif inStartupGrace() then
     writeAt(2, 21, ("Startup grace: %.1fs"):format(math.max(0, state.startupGraceUntil - now())), colors.orange)
+  elseif state.mode == "IDLE" and info and reactorIsChargeReady(info) then
+    writeAt(2, 21, "Charge ready - press Start", colors.lime)
   end
 
   local apiY = math.max(22, h - 6)
@@ -889,8 +881,8 @@ end
 local function doStart()
   local info = state.lastInfo
 
-  if not reactorIsChargedEnough(info) then
-    pushLog("Start blocked: reactor not charged enough")
+  if not reactorIsChargeReady(info) then
+    pushLog("Start blocked: reactor not charge-ready")
     return
   end
 
@@ -903,7 +895,7 @@ local function doStart()
   state.startupGraceUntil = now() + CONFIG.STARTUP_SCRAM_GRACE_SECONDS
   state.rampStart = now()
 
-  setFlows(CONFIG.STARTUP_PUNCH_INPUT, 0)
+  setFlows(CONFIG.MAX_INPUT, 0)
 
   local ok, err = callReactor("activate")
   if ok then
@@ -984,6 +976,7 @@ local function bootstrap()
   pushLog("Targets: 8000C / variable field / 42% sat")
   pushLog("Default field target: 50%")
   pushLog("75x startup retune loaded")
+  pushLog("Charge capped for manual start")
   if usingMonitor then
     pushLog("Monitor touch enabled")
   end
