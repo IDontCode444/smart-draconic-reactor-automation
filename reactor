@@ -24,6 +24,8 @@ local CONFIG = {
   DEFAULT_FIELD_TARGET = 0.50,
 
   CHARGE_INFLOW = 300000000,
+  CHARGE_RETRY_SECONDS = 2,
+
   STARTUP_PRIME_INPUT = 800000000,
   STARTUP_PUNCH_INPUT = 1200000000,
   STARTUP_PUNCH_SECONDS = 6,
@@ -91,6 +93,7 @@ local state = {
   startupPunchUntil = nil,
   scramReason = nil,
   scramArmed = false,
+  lastChargeAttempt = 0,
 
   inputOverride = 0,
   outputOverride = 0,
@@ -540,6 +543,19 @@ local function updateCharging(info)
   state.scramArmed = false
   setFlows(CONFIG.CHARGE_INFLOW, 0)
 
+  if info.status == "cold" or info.fieldPct < CONFIG.ACTIVATE_MIN_FIELD or info.satPct < CONFIG.ACTIVATE_MIN_SAT then
+    if (now() - (state.lastChargeAttempt or 0)) >= CONFIG.CHARGE_RETRY_SECONDS then
+      local ok, err = callReactor("charge")
+      state.lastChargeAttempt = now()
+
+      if ok then
+        pushLog("Charge re-requested")
+      else
+        pushLog("Charge retry failed: " .. tostring(err))
+      end
+    end
+  end
+
   if reactorIsChargedEnough(info) then
     state.mode = "STARTING"
     state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
@@ -826,8 +842,11 @@ local function doCharge()
   state.rampStart = nil
   state.holdUntil = nil
   state.startupPunchUntil = nil
+  state.lastChargeAttempt = 0
 
   local ok, err = callReactor("charge")
+  state.lastChargeAttempt = now()
+
   if ok then
     pushLog("Charge requested")
   else
