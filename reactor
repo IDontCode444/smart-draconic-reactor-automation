@@ -30,6 +30,9 @@ local CONFIG = {
   CHARGE_READY_SAT = 0.48,
   CHARGE_HOLD_INPUT = 300000000,
 
+  PRESTART_SECONDS = 1.5,
+  PRESTART_CHARGE_RETRY = 0.25,
+
   STARTUP_PRIME_INPUT = 800000000,
   STARTUP_PUNCH_INPUT = 1200000000,
   STARTUP_PUNCH_SECONDS = 6,
@@ -86,7 +89,7 @@ local api = {
 }
 
 local state = {
-  mode = "IDLE", -- IDLE, CHARGING, READY, STARTING, RUNNING, STOPPING, SCRAM
+  mode = "IDLE", -- IDLE, CHARGING, READY, PRESTART, STARTING, RUNNING, STOPPING, SCRAM
   targetField = CONFIG.DEFAULT_FIELD_TARGET,
   manualOutputBias = 1.0,
 
@@ -96,6 +99,8 @@ local state = {
   holdUntil = nil,
   startupPunchUntil = nil,
   startupGraceUntil = nil,
+  prestartUntil = nil,
+  lastPrestartCharge = 0,
   scramReason = nil,
   scramArmed = false,
   lastChargeAttempt = 0,
@@ -594,6 +599,35 @@ local function updateReady(info)
   end
 end
 
+local function updatePrestart(info)
+  state.scramReason = nil
+  state.scramArmed = false
+
+  setFlows(CONFIG.MAX_INPUT, 0)
+
+  if (now() - (state.lastPrestartCharge or 0)) >= CONFIG.PRESTART_CHARGE_RETRY then
+    callReactor("charge")
+    state.lastPrestartCharge = now()
+  end
+
+  if now() >= (state.prestartUntil or 0) then
+    state.mode = "STARTING"
+    state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
+    state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
+    state.startupGraceUntil = now() + CONFIG.STARTUP_SCRAM_GRACE_SECONDS
+    state.rampStart = now()
+
+    setFlows(CONFIG.MAX_INPUT, 0)
+
+    local ok, err = callReactor("activate")
+    if ok then
+      pushLog("Activation requested")
+    else
+      pushLog("Activation failed: " .. tostring(err))
+    end
+  end
+end
+
 local function updateStopping(info)
   state.scramArmed = true
 
@@ -737,7 +771,7 @@ local function updateController()
   local info = readInfo()
   state.lastInfo = info
 
-  if state.mode == "IDLE" or state.mode == "CHARGING" or state.mode == "READY" then
+  if state.mode == "IDLE" or state.mode == "CHARGING" or state.mode == "READY" or state.mode == "PRESTART" then
     state.scramArmed = false
   end
 
@@ -759,6 +793,8 @@ local function updateController()
     updateCharging(info)
   elseif state.mode == "READY" then
     updateReady(info)
+  elseif state.mode == "PRESTART" then
+    updatePrestart(info)
   elseif state.mode == "STARTING" or state.mode == "RUNNING" then
     updateRunning(info, dt)
   elseif state.mode == "STOPPING" then
@@ -815,6 +851,7 @@ local function drawUI()
   if state.mode == "STARTING" then modeColor = colors.orange end
   if state.mode == "CHARGING" then modeColor = colors.cyan end
   if state.mode == "READY" then modeColor = colors.lime end
+  if state.mode == "PRESTART" then modeColor = colors.lightBlue end
 
   writeAt(2, 3, "Mode: ", colors.lightGray)
   writeAt(8, 3, state.mode, modeColor)
@@ -852,10 +889,12 @@ local function drawUI()
 
   if state.scramReason then
     writeAt(2, 21, "SCRAM reason: " .. state.scramReason, colors.red)
-  elseif inStartupGrace() then
-    writeAt(2, 21, ("Startup grace: %.1fs"):format(math.max(0, state.startupGraceUntil - now())), colors.orange)
   elseif state.mode == "READY" then
     writeAt(2, 21, "Charge ready - shield held - press Start", colors.lime)
+  elseif state.mode == "PRESTART" then
+    writeAt(2, 21, ("Prestart staging: %.1fs"):format(math.max(0, (state.prestartUntil or 0) - now())), colors.lightBlue)
+  elseif inStartupGrace() then
+    writeAt(2, 21, ("Startup grace: %.1fs"):format(math.max(0, state.startupGraceUntil - now())), colors.orange)
   end
 
   local apiY = math.max(22, h - 6)
@@ -890,6 +929,8 @@ local function doCharge()
   state.holdUntil = nil
   state.startupPunchUntil = nil
   state.startupGraceUntil = nil
+  state.prestartUntil = nil
+  state.lastPrestartCharge = 0
   state.lastChargeAttempt = 0
 
   local ok, err = callReactor("charge")
@@ -915,20 +956,16 @@ local function doStart()
   resetAllPIDs()
   state.scramReason = nil
   state.scramArmed = false
-  state.mode = "STARTING"
-  state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
-  state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
-  state.startupGraceUntil = now() + CONFIG.STARTUP_SCRAM_GRACE_SECONDS
-  state.rampStart = now()
+  state.mode = "PRESTART"
+  state.prestartUntil = now() + CONFIG.PRESTART_SECONDS
+  state.lastPrestartCharge = 0
+  state.holdUntil = nil
+  state.startupPunchUntil = nil
+  state.startupGraceUntil = nil
+  state.rampStart = nil
 
   setFlows(CONFIG.MAX_INPUT, 0)
-
-  local ok, err = callReactor("activate")
-  if ok then
-    pushLog("Start requested")
-  else
-    pushLog("Start failed: " .. tostring(err))
-  end
+  pushLog("Prestart staging")
 end
 
 local function setFieldTarget(v)
@@ -1003,6 +1040,7 @@ local function bootstrap()
   pushLog("Default field target: 50%")
   pushLog("75x startup retune loaded")
   pushLog("READY mode holds start charge")
+  pushLog("PRESTART ignition staging enabled")
   if usingMonitor then
     pushLog("Monitor touch enabled")
   end
