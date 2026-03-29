@@ -1,13 +1,12 @@
 -- Draconic Evolution Reactor Controller for CC:Tweaked / ATM10 6.2
--- Fixed:
---   - compatibility wrapper calling methods with wrong arguments
---   - false SCRAM while cold/charging
--- Added:
---   - monitor autodetect
---   - monitor touch support
---   - dynamic large-monitor UI
---   - reactor/gate API autodetect
---   - live field target buttons
+-- Features:
+--   - Separate PID for input and output
+--   - Slow startup ramp
+--   - Auto SCRAM with proper arming/disarming logic
+--   - Live field target buttons: 35/40/45/50%
+--   - Monitor autodetect + monitor touch support
+--   - Large-monitor friendly UI
+--   - Compatibility detection for common reactor/gate methods
 
 local CONFIG = {
   REACTOR_NAME = "draconic_reactor_0",
@@ -16,7 +15,6 @@ local CONFIG = {
 
   LOOP_INTERVAL = 0.25,
   UI_REFRESH = 0.20,
-
   MONITOR_TEXT_SCALE = 0.5,
 
   TARGET_TEMP = 8000,
@@ -44,7 +42,6 @@ local CONFIG = {
 
   MAX_INPUT = 60000000,
   MAX_OUTPUT = 120000000,
-
   DRAW_SCALE = 1.0,
 
   PID_INPUT = {
@@ -85,6 +82,7 @@ local state = {
   rampStart = nil,
   holdUntil = nil,
   scramReason = nil,
+  scramArmed = false,
 
   inputOverride = 0,
   outputOverride = 0,
@@ -462,13 +460,8 @@ local function getSoftFieldLow()
   return math.max(0.28, state.targetField - 0.07)
 end
 
-local function reactorIsActuallyActive(info)
-  local s = tostring(info.status or "")
-  return (s == "starting" or s == "running" or s == "stopping" or s == "cooling" or info.temperature >= 2000)
-end
-
 local function shouldScram(info)
-  if not reactorIsActuallyActive(info) then
+  if not state.scramArmed then
     return false, nil
   end
 
@@ -476,7 +469,7 @@ local function shouldScram(info)
     return true, ("temperature %.1f >= %.0f"):format(info.temperature, CONFIG.SCRAM_TEMP)
   end
 
-  if (info.status == "running" or info.status == "starting" or info.temperature > 2500) and info.fieldPct <= CONFIG.SCRAM_FIELD then
+  if info.fieldPct <= CONFIG.SCRAM_FIELD then
     return true, ("field %.1f%% <= %.1f%%"):format(pct(info.fieldPct), pct(CONFIG.SCRAM_FIELD))
   end
 
@@ -498,6 +491,7 @@ end
 local function scram(reason)
   state.mode = "SCRAM"
   state.scramReason = reason
+  state.scramArmed = true
   resetAllPIDs()
 
   callReactor("stop")
@@ -508,6 +502,7 @@ end
 local function stopReactorControlled()
   state.mode = "STOPPING"
   state.scramReason = nil
+  state.scramArmed = true
   resetAllPIDs()
   callReactor("stop")
   pushLog("Stop requested")
@@ -527,12 +522,14 @@ end
 
 local function updateCharging(info)
   state.scramReason = nil
+  state.scramArmed = false
   setFlows(CONFIG.CHARGE_INFLOW, 0)
 
   if info.status == "charged" or (info.temperature >= 2000 and info.fieldPct >= 0.45 and info.satPct >= 0.45) then
     state.mode = "STARTING"
     state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
     state.rampStart = now()
+    state.scramArmed = false
 
     local ok, err = callReactor("activate")
     if ok then
@@ -544,10 +541,13 @@ local function updateCharging(info)
 end
 
 local function updateStopping(info)
+  state.scramArmed = true
+
   local sustain = calcFieldFeedForward(info, CONFIG.SCRAM_FIELD_RECOVERY)
   setFlows(sustain, 0)
 
   if info.status == "cold" or info.temperature < 2100 then
+    state.scramArmed = false
     setFlows(0, 0)
     state.mode = "IDLE"
     pushLog("Reactor stopped")
@@ -555,16 +555,23 @@ local function updateStopping(info)
 end
 
 local function updateScram(info)
+  state.scramArmed = true
+
   local sustain = calcFieldFeedForward(info, CONFIG.SCRAM_FIELD_RECOVERY)
   setFlows(sustain, 0)
 
   if info.status == "cold" or info.temperature < 2100 then
+    state.scramArmed = false
     setFlows(0, 0)
   end
 end
 
 local function updateRunning(info, dt)
   local fieldTarget, satTarget, rampProgress = getRampTargets()
+
+  if (info.status == "running" or info.status == "starting" or info.temperature >= 2000 or info.fieldPct >= 0.10) then
+    state.scramArmed = true
+  end
 
   if state.mode == "STARTING" then
     if now() < (state.holdUntil or 0) then
@@ -616,6 +623,14 @@ end
 local function updateController()
   local info = readInfo()
   state.lastInfo = info
+
+  if state.mode == "IDLE" or state.mode == "CHARGING" then
+    state.scramArmed = false
+  end
+
+  if info.temperature < 2000 and info.fieldPct < 0.05 and info.satPct < 0.05 and info.status == "cold" then
+    state.scramArmed = false
+  end
 
   local t = now()
   local dt = math.max(0.05, t - state.lastLoopAt)
@@ -685,42 +700,43 @@ local function drawUI()
 
   writeAt(2, 3, "Mode: ", colors.lightGray)
   writeAt(8, 3, state.mode, modeColor)
+  writeAt(2, 4, "SCRAM armed: " .. (state.scramArmed and "YES" or "NO"), state.scramArmed and colors.red or colors.lime)
 
   if not info then
-    writeAt(2, 5, "Waiting for reactor data...", colors.orange)
+    writeAt(2, 6, "Waiting for reactor data...", colors.orange)
   else
     local leftX = 2
     local rightX = math.max(36, math.floor(w / 2))
 
-    writeAt(leftX, 5, ("Status: %s"):format(tostring(info.status)), colors.white)
-    writeAt(leftX, 6, ("Temp: %.1f C"):format(info.temperature), colors.white)
-    writeAt(leftX, 7, ("Field: %.1f%%"):format(pct(info.fieldPct)), colors.white)
-    writeAt(leftX, 8, ("Sat: %.1f%%"):format(pct(info.satPct)), colors.white)
-    writeAt(leftX, 9, ("Fuel: %.2f%%"):format(info.fuelPct * 100), colors.white)
-    writeAt(leftX, 10, ("Gen: %.0f RF/t"):format(info.generationRate or 0), colors.white)
-    writeAt(leftX, 11, ("In:  %d RF/t"):format(state.inputOverride), colors.lightBlue)
-    writeAt(leftX, 12, ("Out: %d RF/t"):format(state.outputOverride), colors.lightBlue)
+    writeAt(leftX, 6, ("Status: %s"):format(tostring(info.status)), colors.white)
+    writeAt(leftX, 7, ("Temp: %.1f C"):format(info.temperature), colors.white)
+    writeAt(leftX, 8, ("Field: %.1f%%"):format(pct(info.fieldPct)), colors.white)
+    writeAt(leftX, 9, ("Sat: %.1f%%"):format(pct(info.satPct)), colors.white)
+    writeAt(leftX, 10, ("Fuel: %.2f%%"):format(info.fuelPct * 100), colors.white)
+    writeAt(leftX, 11, ("Gen: %.0f RF/t"):format(info.generationRate or 0), colors.white)
+    writeAt(leftX, 12, ("In:  %d RF/t"):format(state.inputOverride), colors.lightBlue)
+    writeAt(leftX, 13, ("Out: %d RF/t"):format(state.outputOverride), colors.lightBlue)
 
-    writeAt(rightX, 5, ("Target Temp: %.0f C"):format(CONFIG.TARGET_TEMP), colors.white)
-    writeAt(rightX, 6, ("Target Field: %.1f%%"):format(pct(state.targetField)), colors.white)
-    writeAt(rightX, 7, ("Target Sat: %.1f%%"):format(pct(CONFIG.TARGET_SAT)), colors.white)
-    writeAt(rightX, 8, ("Drain: %.0f RF/t"):format(info.fieldDrainRate or 0), colors.white)
-    writeAt(rightX, 9, ("Burn: %.6f/t"):format(info.fuelConversionRate or 0), colors.white)
-    writeAt(rightX, 10, ("Bias: %.0f%%"):format(state.manualOutputBias * 100), colors.white)
+    writeAt(rightX, 6, ("Target Temp: %.0f C"):format(CONFIG.TARGET_TEMP), colors.white)
+    writeAt(rightX, 7, ("Target Field: %.1f%%"):format(pct(state.targetField)), colors.white)
+    writeAt(rightX, 8, ("Target Sat: %.1f%%"):format(pct(CONFIG.TARGET_SAT)), colors.white)
+    writeAt(rightX, 9, ("Drain: %.0f RF/t"):format(info.fieldDrainRate or 0), colors.white)
+    writeAt(rightX, 10, ("Burn: %.6f/t"):format(info.fuelConversionRate or 0), colors.white)
+    writeAt(rightX, 11, ("Bias: %.0f%%"):format(state.manualOutputBias * 100), colors.white)
 
     local barWidth = math.max(20, w - 4)
-    progressBar(2, 14, barWidth, info.fieldPct, colors.blue, ("Field %.1f%%"):format(pct(info.fieldPct)))
-    progressBar(2, 15, barWidth, info.satPct, colors.orange, ("Sat %.1f%%"):format(pct(info.satPct)))
-    progressBar(2, 16, barWidth, clamp(info.temperature / CONFIG.SCRAM_TEMP, 0, 1), colors.red, ("Temp %.0f / %.0f"):format(info.temperature, CONFIG.SCRAM_TEMP))
+    progressBar(2, 15, barWidth, info.fieldPct, colors.blue, ("Field %.1f%%"):format(pct(info.fieldPct)))
+    progressBar(2, 16, barWidth, info.satPct, colors.orange, ("Sat %.1f%%"):format(pct(info.satPct)))
+    progressBar(2, 17, barWidth, clamp(info.temperature / CONFIG.SCRAM_TEMP, 0, 1), colors.red, ("Temp %.0f / %.0f"):format(info.temperature, CONFIG.SCRAM_TEMP))
   end
 
-  drawFieldButtons(2, 18)
+  drawFieldButtons(2, 19)
 
   if state.scramReason then
-    writeAt(2, 20, "SCRAM reason: " .. state.scramReason, colors.red)
+    writeAt(2, 21, "SCRAM reason: " .. state.scramReason, colors.red)
   end
 
-  local apiY = math.max(21, h - 6)
+  local apiY = math.max(22, h - 6)
   if apiY < h - 3 then
     local s = state.apiSummary
     if #s > (w - 4) then
@@ -729,11 +745,11 @@ local function drawUI()
     writeAt(2, apiY, s, colors.gray)
   end
 
-  if h >= 26 then
+  if h >= 27 then
     drawControls(h - 3, h - 1)
   end
 
-  local logY = math.max(22, apiY + 1)
+  local logY = math.max(23, apiY + 1)
   if logY < h - 4 then
     writeAt(2, logY, "Log:", colors.lightGray)
     local maxLines = h - logY - 4
@@ -746,6 +762,7 @@ end
 local function doCharge()
   resetAllPIDs()
   state.scramReason = nil
+  state.scramArmed = false
   state.mode = "CHARGING"
   state.rampStart = nil
   state.holdUntil = nil
@@ -761,6 +778,7 @@ end
 local function doStart()
   resetAllPIDs()
   state.scramReason = nil
+  state.scramArmed = false
   state.mode = "STARTING"
   state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
   state.rampStart = now()
