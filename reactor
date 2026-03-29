@@ -1,9 +1,13 @@
 -- draconic_manager.lua
 -- Production / unattended Draconic Evolution reactor controller for CC:Tweaked
--- Revised:
+-- Hardened startup version:
 --   - delayed activation
 --   - startup no-flow detection
 --   - lower-flicker monitor refresh
+--   - 0 startup output
+--   - very high startup input floor
+--   - 5-second startup stability hold
+--   - automatic live input regulation after startup
 -- Edit ONLY the CONFIG table below.
 
 local CONFIG = {
@@ -18,8 +22,8 @@ local CONFIG = {
   monitorRefresh = 0.25,
 
   targets = {
-    field = 0.48,
-    emergencyField = 0.20,
+    field = 0.35,
+    emergencyField = 0.15,
 
     saturation = 0.78,
     saturationBand = 0.04,
@@ -34,10 +38,12 @@ local CONFIG = {
   },
 
   startup = {
-    chargeInput = 2000000,
-    warmupMinInput = 600000,
-    initialOutput = 50000,
-    noFlowWarningTicks = 100, -- 100 ticks at 0.10s ~= 10 seconds
+    chargeInput = 100000000,         -- hard startup floor before and just after activation
+    warmupMinInput = 100000000,      -- minimum input during startup hold
+    initialOutput = 0,               -- keep output at zero until stable
+    noFlowWarningTicks = 100,        -- 10 seconds at 0.10 loop
+    stableHoldSeconds = 5.0,         -- must remain stable this long before normal regulation
+    maxStartupInput = 300000000,     -- clamp startup containment burst
   },
 
   output = {
@@ -46,11 +52,13 @@ local CONFIG = {
 
     minStep = 50000,
     maxStep = 25000000,
-    gain = 0.12,
+    gain = 0.06,
   },
 
   control = {
-    inputMargin = 1.08,
+    inputMargin = 1.10,
+    maxInput = 2147483647,           -- hard cap for automatic input control
+    startupBoostFactor = 1.25,       -- extra margin during startup hold
   },
 
   safety = {
@@ -75,6 +83,7 @@ local state = {
   lastSummary = "",
   lastDraw = 0,
   startupNoFlowTicks = 0,
+  startupStableTicks = 0,
 }
 
 local reactor
@@ -169,7 +178,7 @@ local function bindPeripherals()
 end
 
 local function setInput(rate)
-  rate = clamp(round(rate), 0, CONFIG.output.max)
+  rate = clamp(round(rate), 0, CONFIG.control.maxInput)
   inputGate.setSignalLowFlow(rate)
   return rate
 end
@@ -204,7 +213,7 @@ end
 
 local function summaryText(info)
   return string.format(
-    "status=%s temp=%.0fC field=%.2f%% sat=%.2f%% gen=%d drain=%d in=%d out=%d fuel=%.2f%% auto=%s latched=%s",
+    "status=%s temp=%.0fC field=%.2f%% sat=%.2f%% gen=%d drain=%d in=%d out=%d fuel=%.2f%% auto=%s startup=%s latched=%s",
     tostring(info.status),
     safeNumber(info.temperature, 0),
     getFieldPct(info) * 100,
@@ -215,6 +224,7 @@ local function summaryText(info)
     round(outputGate.getSignalLowFlow()),
     getFuelPct(info) * 100,
     tostring(state.autoMode),
+    tostring(state.startupComplete),
     tostring(state.latched)
   )
 end
@@ -223,6 +233,7 @@ local function emergencyStop(reason)
   state.emergency = true
   state.autoMode = false
   state.startupComplete = false
+  state.startupStableTicks = 0
 
   if CONFIG.safety.latchEmergency then
     state.latched = true
@@ -242,6 +253,8 @@ local function resetLatch()
   state.latchReason = nil
   state.emergency = false
   state.startupNoFlowTicks = 0
+  state.startupStableTicks = 0
+  state.startupComplete = false
   log("Emergency latch reset.", true)
 end
 
@@ -301,6 +314,7 @@ local function drawMain(info)
   local field = getFieldPct(info) * 100
   local sat = getSatPct(info) * 100
   local fuel = getFuelPct(info) * 100
+  local stableNeeded = math.max(1, round(CONFIG.startup.stableHoldSeconds / CONFIG.loopDelay))
 
   writeLine(monitor, 2, 1, "Draconic Reactor Manager", colors.yellow)
   writeLine(monitor, 2, 2, "Main", colors.lightGray)
@@ -324,6 +338,13 @@ local function drawMain(info)
   writeLine(monitor, 2, 15, "Drain:  " .. round(safeNumber(info.fieldDrainRate, 0)) .. " rf/t")
   writeLine(monitor, 2, 16, "Input:  " .. round(inputGate.getSignalLowFlow()) .. " rf/t")
   writeLine(monitor, 2, 17, "Output: " .. round(outputGate.getSignalLowFlow()) .. " rf/t")
+
+  if not state.startupComplete and info.status == "running" then
+    writeLine(monitor, 2, 19,
+      string.format("Startup hold: %d / %d ticks", state.startupStableTicks, stableNeeded),
+      colors.cyan
+    )
+  end
 
   addButton("start", makeButton(monitor, w - 18, 3, w - 2, 5, "START", colors.black, colors.lime))
   addButton("stop", makeButton(monitor, w - 18, 6, w - 2, 8, "STOP", colors.white, colors.red))
@@ -380,7 +401,6 @@ local function reactorReadyToActivate(info)
   local temp = safeNumber(info.temperature, 0)
   local field = getFieldPct(info)
   local sat = getSatPct(info)
-
   return temp >= 2000 or field > 0.01 or sat > 0.01
 end
 
@@ -406,6 +426,7 @@ end
 local function handleColdOrWarming(info)
   state.emergency = false
   state.startupComplete = false
+  state.startupStableTicks = 0
   setOutput(0)
 
   if state.latched then
@@ -421,6 +442,7 @@ local function handleColdOrWarming(info)
   end
 
   if info.status == "warming_up" then
+    setInput(CONFIG.startup.chargeInput)
     if reactorReadyToActivate(info) then
       pcall(function() reactor.activateReactor() end)
     end
@@ -430,6 +452,7 @@ end
 
 local function handleStoppingOrCooling(info)
   setOutput(0)
+  state.startupStableTicks = 0
 
   if state.latched then
     setInput(0)
@@ -443,32 +466,50 @@ local function handleStoppingOrCooling(info)
   end
 end
 
-local function startupTransition(info)
+local function startupConditionsGood(info)
   local field = getFieldPct(info)
   local sat = getSatPct(info)
+  local temp = safeNumber(info.temperature, 0)
 
+  return temp >= CONFIG.targets.startupTemp
+     and sat >= CONFIG.targets.startupSat
+     and field >= CONFIG.targets.startupField
+end
+
+local function startupTransition(info)
   if info.status ~= "running" then
     state.startupComplete = false
+    state.startupStableTicks = 0
     return false
   end
 
-  if safeNumber(info.temperature, 0) < CONFIG.targets.startupTemp
-    or sat < CONFIG.targets.startupSat
-    or field < CONFIG.targets.startupField then
+  local exactIn = exactFieldInput(info, CONFIG.targets.field)
+  local startupInput = math.max(
+    CONFIG.startup.warmupMinInput,
+    exactIn * CONFIG.control.startupBoostFactor
+  )
+  startupInput = clamp(startupInput, 0, CONFIG.startup.maxStartupInput)
 
-    local exactIn = exactFieldInput(info, CONFIG.targets.field) * CONFIG.control.inputMargin
-    setInput(math.max(CONFIG.startup.warmupMinInput, exactIn))
-    setOutput(CONFIG.startup.initialOutput)
-    state.startupComplete = false
-    return true
+  setInput(startupInput)
+  setOutput(0)
+
+  if startupConditionsGood(info) then
+    state.startupStableTicks = state.startupStableTicks + 1
+  else
+    state.startupStableTicks = 0
   end
 
-  if not state.startupComplete then
-    state.startupComplete = true
-    log("Startup thresholds reached. Normal regulation enabled.", true)
+  local neededTicks = math.max(1, round(CONFIG.startup.stableHoldSeconds / CONFIG.loopDelay))
+
+  if state.startupStableTicks >= neededTicks then
+    if not state.startupComplete then
+      state.startupComplete = true
+      log("Startup stability hold complete. Normal regulation enabled.", true)
+    end
+    return false
   end
 
-  return false
+  return true
 end
 
 local function regulateRunning(info)
@@ -482,16 +523,13 @@ local function regulateRunning(info)
   local exactIn = exactFieldInput(info, CONFIG.targets.field)
   local commandedInput = exactIn * CONFIG.control.inputMargin
 
-  if temp < CONFIG.targets.startupTemp then
-    commandedInput = math.max(commandedInput, CONFIG.startup.warmupMinInput)
-  end
-
   if field < CONFIG.targets.field - 0.08 then
     commandedInput = math.max(commandedInput, drain * 3)
   elseif field < CONFIG.targets.field - 0.03 then
     commandedInput = math.max(commandedInput, drain * 2)
   end
 
+  commandedInput = clamp(commandedInput, 0, CONFIG.control.maxInput)
   setInput(commandedInput)
 
   if not state.autoMode then
@@ -576,10 +614,21 @@ local function controllerTick()
   elseif info.status == "stopping" or info.status == "cooling" then
     handleStoppingOrCooling(info)
   elseif info.status == "running" then
-    if not startupTransition(info) then
-      regulateRunning(info)
+    if state.autoMode then
+      if not state.startupComplete then
+        if not startupTransition(info) then
+          regulateRunning(info)
+        end
+      else
+        regulateRunning(info)
+      end
+    else
+      setOutput(0)
+      local exactIn = exactFieldInput(info, CONFIG.targets.field) * CONFIG.control.inputMargin
+      setInput(clamp(math.max(CONFIG.startup.warmupMinInput, exactIn), 0, CONFIG.control.maxInput))
     end
   else
+    state.startupStableTicks = 0
     setOutput(0)
     setInput(CONFIG.startup.chargeInput)
   end
@@ -595,9 +644,6 @@ local function startupCheck()
   if not ok or not info then
     error("Reactor peripheral did not return reactor info.")
   end
-
-  requireMethod(inputGate, "input gate", "getSignalLowFlow")
-  requireMethod(outputGate, "output gate", "getSignalLowFlow")
 
   pcall(function() inputGate.getSignalLowFlow() end)
   pcall(function() outputGate.getSignalLowFlow() end)
@@ -655,7 +701,10 @@ local function doStart()
   state.emergency = false
   state.startupComplete = false
   state.startupNoFlowTicks = 0
+  state.startupStableTicks = 0
 
+  setOutput(0)
+  setInput(CONFIG.startup.chargeInput)
   pcall(function() reactor.chargeReactor() end)
 
   print("Charge sequence issued.")
