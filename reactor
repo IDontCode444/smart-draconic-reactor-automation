@@ -1,4 +1,4 @@
--- Draconic Evolution Reactor Controller for CC:Tweaked / ATM10 6.2
+-- Draconic Evolution Reactor Controller for CC:Tweaked / ATM10
 -- Features:
 --   - Separate PID for input and output
 --   - Slow startup ramp
@@ -39,6 +39,11 @@ local CONFIG = {
   STARTUP_HOLD_SECONDS = 32,
   STARTUP_SCRAM_GRACE_SECONDS = 12,
   STARTUP_MIN_FIELD_FOR_ARM = 0.28,
+  STARTUP_SAFE_FIELD = 0.56,
+  STARTUP_SAFE_SAT = 0.70,
+  STARTUP_STABLE_SECONDS = 8,
+  STARTUP_FIELD_HARD_FLOOR = 0.46,
+  STARTUP_EXTRA_INPUT = 350000000,
 
   RAMP_SECONDS = 300,
   RAMP_START_FIELD = 0.58,
@@ -59,6 +64,7 @@ local CONFIG = {
   MAX_INPUT = 1500000000,
   MAX_OUTPUT = 260000000,
   DRAW_SCALE = 1.0,
+  RUN_FIELD_RECOVERY_BONUS = 250000000,
 
   PID_INPUT = {
     kp = 1.20, ki = 0.06, kd = 0.10,
@@ -99,6 +105,7 @@ local state = {
   holdUntil = nil,
   startupPunchUntil = nil,
   startupGraceUntil = nil,
+  startupStableSince = nil,
   prestartUntil = nil,
   lastPrestartCharge = 0,
   scramReason = nil,
@@ -615,6 +622,7 @@ local function updatePrestart(info)
     state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
     state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
     state.startupGraceUntil = now() + CONFIG.STARTUP_SCRAM_GRACE_SECONDS
+    state.startupStableSince = nil
     state.rampStart = now()
 
     setFlows(CONFIG.MAX_INPUT, 0)
@@ -658,17 +666,23 @@ local function updateRunning(info, dt)
   local fieldTarget, satTarget, rampProgress = getRampTargets()
 
   if state.mode == "STARTING" then
+    local startupFieldTarget = math.max(fieldTarget, CONFIG.RAMP_START_FIELD, CONFIG.STARTUP_SAFE_FIELD)
+    local startupFeed = calcFieldFeedForward(info, startupFieldTarget) + CONFIG.STARTUP_EXTRA_INPUT
+
     if inStartupGrace() then
       state.scramArmed = false
 
-      local startupInput = CONFIG.STARTUP_PUNCH_INPUT
+      local startupInput = math.max(CONFIG.STARTUP_PUNCH_INPUT, startupFeed)
+
       if info.fieldPct < 0.20 then
         startupInput = CONFIG.MAX_INPUT
       elseif info.fieldPct < CONFIG.STARTUP_MIN_FIELD_FOR_ARM then
-        startupInput = math.max(CONFIG.STARTUP_PUNCH_INPUT, CONFIG.STARTUP_PRIME_INPUT * 1.35)
+        startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT * 1.35)
+      elseif info.fieldPct < CONFIG.STARTUP_FIELD_HARD_FLOOR then
+        startupInput = CONFIG.MAX_INPUT
       end
 
-      setFlows(startupInput, 0)
+      setFlows(clamp(startupInput, 0, CONFIG.MAX_INPUT), 0)
       return
     end
 
@@ -676,27 +690,41 @@ local function updateRunning(info, dt)
       state.scramArmed = true
     end
 
-    if now() < (state.holdUntil or 0) then
-      local startupField = math.max(fieldTarget, CONFIG.RAMP_START_FIELD)
-      local startupInput = math.max(calcFieldFeedForward(info, startupField), CONFIG.STARTUP_PRIME_INPUT)
+    local startupInput = math.max(CONFIG.STARTUP_PRIME_INPUT, startupFeed)
 
-      if now() < (state.startupPunchUntil or 0) then
-        startupInput = CONFIG.STARTUP_PUNCH_INPUT
-      elseif info.fieldPct < 0.20 then
-        startupInput = CONFIG.MAX_INPUT
-      elseif info.fieldPct < 0.35 then
-        startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT * 1.20)
-      elseif info.fieldPct < 0.50 then
-        startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT)
-      end
-
-      setFlows(startupInput, 0)
-      return
-    else
-      state.mode = "RUNNING"
-      state.scramArmed = true
-      pushLog("Closed-loop control engaged")
+    if now() < (state.startupPunchUntil or 0) then
+      startupInput = math.max(startupInput, CONFIG.STARTUP_PUNCH_INPUT)
     end
+
+    if info.fieldPct < CONFIG.STARTUP_FIELD_HARD_FLOOR then
+      startupInput = CONFIG.MAX_INPUT
+    elseif info.fieldPct < 0.50 then
+      startupInput = math.max(startupInput, CONFIG.STARTUP_PUNCH_INPUT)
+    elseif info.fieldPct < CONFIG.STARTUP_SAFE_FIELD then
+      startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT)
+    end
+
+    if info.fieldPct >= CONFIG.STARTUP_SAFE_FIELD and info.satPct >= CONFIG.STARTUP_SAFE_SAT then
+      if not state.startupStableSince then
+        state.startupStableSince = now()
+      end
+    else
+      state.startupStableSince = nil
+    end
+
+    if now() < (state.holdUntil or 0) then
+      setFlows(clamp(startupInput, 0, CONFIG.MAX_INPUT), 0)
+      return
+    end
+
+    if not state.startupStableSince or (now() - state.startupStableSince) < CONFIG.STARTUP_STABLE_SECONDS then
+      setFlows(clamp(startupInput, 0, CONFIG.MAX_INPUT), 0)
+      return
+    end
+
+    state.mode = "RUNNING"
+    state.scramArmed = true
+    pushLog("Closed-loop control engaged")
   else
     if (info.status == "running" or info.status == "starting" or info.temperature >= 2000 or info.fieldPct >= 0.10) then
       state.scramArmed = true
@@ -725,19 +753,20 @@ local function updateRunning(info, dt)
 
   if info.fieldPct < getSoftFieldLow() then
     outputCmd = outputCmd * 0.15
-    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, math.max(fieldTarget, 0.68)))
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, math.max(fieldTarget, 0.68)) + CONFIG.RUN_FIELD_RECOVERY_BONUS)
   end
 
   if info.fieldPct < 0.30 then
     outputCmd = 0
-    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.75))
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.75) + CONFIG.RUN_FIELD_RECOVERY_BONUS)
   elseif info.fieldPct < 0.40 then
     outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.03)
-    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.70))
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.70) + CONFIG.RUN_FIELD_RECOVERY_BONUS)
   elseif info.fieldPct < 0.50 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.12)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.08)
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.65) + CONFIG.RUN_FIELD_RECOVERY_BONUS)
   elseif info.fieldPct < 0.60 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.35)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.25)
   end
 
   if info.satPct < CONFIG.SAT_SOFT_LOW then
@@ -752,7 +781,9 @@ local function updateRunning(info, dt)
     outputCmd = math.max(outputCmd, CONFIG.MAX_OUTPUT * 0.65)
   end
 
-  if rampProgress < 0.20 then
+  if info.fieldPct < CONFIG.STARTUP_SAFE_FIELD then
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.05)
+  elseif rampProgress < 0.20 then
     outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.05)
   elseif rampProgress < 0.40 then
     outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.18)
@@ -929,6 +960,7 @@ local function doCharge()
   state.holdUntil = nil
   state.startupPunchUntil = nil
   state.startupGraceUntil = nil
+  state.startupStableSince = nil
   state.prestartUntil = nil
   state.lastPrestartCharge = 0
   state.lastChargeAttempt = 0
@@ -962,6 +994,7 @@ local function doStart()
   state.holdUntil = nil
   state.startupPunchUntil = nil
   state.startupGraceUntil = nil
+  state.startupStableSince = nil
   state.rampStart = nil
 
   setFlows(CONFIG.MAX_INPUT, 0)
