@@ -14,7 +14,7 @@ local CONFIG = {
   INPUT_GATE_NAME = "flow_gate_0",
   OUTPUT_GATE_NAME = "flow_gate_1",
 
-  LOOP_INTERVAL = 0.10,
+  LOOP_INTERVAL = 0.05,
   UI_REFRESH = 0.20,
   MONITOR_TEXT_SCALE = 0.5,
 
@@ -23,12 +23,14 @@ local CONFIG = {
   FIELD_TARGET_OPTIONS = { 0.45, 0.50, 0.55, 0.60 },
   DEFAULT_FIELD_TARGET = 0.50,
 
-  CHARGE_INFLOW = 200000000,
-  STARTUP_PRIME_INPUT = 360000000,
-  STARTUP_HOLD_SECONDS = 30,
+  CHARGE_INFLOW = 300000000,
+  STARTUP_PRIME_INPUT = 800000000,
+  STARTUP_PUNCH_INPUT = 1200000000,
+  STARTUP_PUNCH_SECONDS = 6,
+  STARTUP_HOLD_SECONDS = 32,
   RAMP_SECONDS = 300,
-  RAMP_START_FIELD = 0.70,
-  RAMP_START_SAT = 0.75,
+  RAMP_START_FIELD = 0.58,
+  RAMP_START_SAT = 0.78,
 
   ACTIVATE_MIN_FIELD = 0.48,
   ACTIVATE_MIN_SAT = 0.48,
@@ -45,14 +47,14 @@ local CONFIG = {
   SAT_SOFT_LOW = 0.28,
   SAT_SOFT_HIGH = 0.85,
 
-  MAX_INPUT = 400000000,
+  MAX_INPUT = 1500000000,
   MAX_OUTPUT = 260000000,
   DRAW_SCALE = 1.0,
 
   PID_INPUT = {
-    kp = 1.65, ki = 0.10, kd = 0.20,
-    min = -120000000, max = 250000000,
-    integralMin = -250000000, integralMax = 250000000,
+    kp = 1.20, ki = 0.06, kd = 0.10,
+    min = -250000000, max = 900000000,
+    integralMin = -500000000, integralMax = 900000000,
   },
 
   PID_OUTPUT = {
@@ -86,6 +88,7 @@ local state = {
   lastLoopAt = os.clock(),
   rampStart = nil,
   holdUntil = nil,
+  startupPunchUntil = nil,
   scramReason = nil,
   scramArmed = false,
 
@@ -540,10 +543,11 @@ local function updateCharging(info)
   if reactorIsChargedEnough(info) then
     state.mode = "STARTING"
     state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
+    state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
     state.rampStart = now()
     state.scramArmed = false
 
-    setFlows(CONFIG.STARTUP_PRIME_INPUT, 0)
+    setFlows(CONFIG.STARTUP_PUNCH_INPUT, 0)
 
     local ok, err = callReactor("activate")
     if ok then
@@ -592,8 +596,12 @@ local function updateRunning(info, dt)
       local startupField = math.max(fieldTarget, CONFIG.RAMP_START_FIELD)
       local startupInput = math.max(calcFieldFeedForward(info, startupField), CONFIG.STARTUP_PRIME_INPUT)
 
-      if info.fieldPct < 0.35 then
+      if now() < (state.startupPunchUntil or 0) then
+        startupInput = CONFIG.STARTUP_PUNCH_INPUT
+      elseif info.fieldPct < 0.20 then
         startupInput = CONFIG.MAX_INPUT
+      elseif info.fieldPct < 0.35 then
+        startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT * 1.20)
       elseif info.fieldPct < 0.50 then
         startupInput = math.max(startupInput, CONFIG.STARTUP_PRIME_INPUT)
       end
@@ -817,6 +825,7 @@ local function doCharge()
   state.mode = "CHARGING"
   state.rampStart = nil
   state.holdUntil = nil
+  state.startupPunchUntil = nil
 
   local ok, err = callReactor("charge")
   if ok then
@@ -839,9 +848,10 @@ local function doStart()
   state.scramArmed = false
   state.mode = "STARTING"
   state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
+  state.startupPunchUntil = now() + CONFIG.STARTUP_PUNCH_SECONDS
   state.rampStart = now()
 
-  setFlows(CONFIG.STARTUP_PRIME_INPUT, 0)
+  setFlows(CONFIG.STARTUP_PUNCH_INPUT, 0)
 
   local ok, err = callReactor("activate")
   if ok then
