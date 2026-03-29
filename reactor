@@ -1,5 +1,9 @@
 -- draconic_manager.lua
 -- Production / unattended Draconic Evolution reactor controller for CC:Tweaked
+-- Revised:
+--   - delayed activation
+--   - startup no-flow detection
+--   - lower-flicker monitor refresh
 -- Edit ONLY the CONFIG table below.
 
 local CONFIG = {
@@ -11,6 +15,7 @@ local CONFIG = {
   },
 
   loopDelay = 0.10,
+  monitorRefresh = 0.25,
 
   targets = {
     field = 0.48,
@@ -32,6 +37,7 @@ local CONFIG = {
     chargeInput = 2000000,
     warmupMinInput = 600000,
     initialOutput = 50000,
+    noFlowWarningTicks = 100, -- 100 ticks at 0.10s ~= 10 seconds
   },
 
   output = {
@@ -48,8 +54,8 @@ local CONFIG = {
   },
 
   safety = {
-    latchEmergency = true,   -- requires manual reset after emergency
-    quietLogs = false,       -- true = fewer console updates
+    latchEmergency = true,
+    quietLogs = false,
   },
 
   ui = {
@@ -67,6 +73,8 @@ local state = {
   startupComplete = false,
   page = "main",
   lastSummary = "",
+  lastDraw = 0,
+  startupNoFlowTicks = 0,
 }
 
 local reactor
@@ -103,7 +111,11 @@ local function log(msg, force)
 end
 
 local function failSafeOutput()
-  pcall(function() if outputGate then outputGate.setSignalLowFlow(0) end end)
+  pcall(function()
+    if outputGate then
+      outputGate.setSignalLowFlow(0)
+    end
+  end)
 end
 
 local function failSafeInput()
@@ -229,6 +241,7 @@ local function resetLatch()
   state.latched = false
   state.latchReason = nil
   state.emergency = false
+  state.startupNoFlowTicks = 0
   log("Emergency latch reset.", true)
 end
 
@@ -321,7 +334,7 @@ local function drawMain(info)
   writeLine(monitor, 2, h - 1, "Touch buttons or use terminal commands.", colors.lightGray)
 end
 
-local function drawTune(info)
+local function drawTune()
   if not monitor then return end
   clearTerm(monitor)
   clearButtons()
@@ -349,10 +362,44 @@ end
 
 local function drawMonitor(info)
   if not monitor then return end
+
+  local now = os.clock()
+  if now - state.lastDraw < CONFIG.monitorRefresh then
+    return
+  end
+  state.lastDraw = now
+
   if state.page == "tune" then
-    drawTune(info)
+    drawTune()
   else
     drawMain(info)
+  end
+end
+
+local function reactorReadyToActivate(info)
+  local temp = safeNumber(info.temperature, 0)
+  local field = getFieldPct(info)
+  local sat = getSatPct(info)
+
+  return temp >= 2000 or field > 0.01 or sat > 0.01
+end
+
+local function detectStartupNoFlow(info)
+  local temp = safeNumber(info.temperature, 0)
+  local inputSet = inputGate.getSignalLowFlow()
+
+  if (info.status == "cold" or info.status == "warming_up")
+    and inputSet > 0
+    and temp <= 25 then
+    state.startupNoFlowTicks = state.startupNoFlowTicks + 1
+  else
+    state.startupNoFlowTicks = 0
+  end
+
+  if state.startupNoFlowTicks >= CONFIG.startup.noFlowWarningTicks then
+    state.startupNoFlowTicks = 0
+    print("WARNING: startup charge requested, but reactor temperature is not rising.")
+    print("Check input gate direction, gate placement, and actual FE supply to injector.")
   end
 end
 
@@ -366,11 +413,18 @@ local function handleColdOrWarming(info)
     return
   end
 
+  setInput(CONFIG.startup.chargeInput)
+
   if info.status == "cold" then
-    setInput(CONFIG.startup.chargeInput)
-    reactor.chargeReactor()
-  elseif info.status == "warming_up" then
-    setInput(CONFIG.startup.chargeInput)
+    pcall(function() reactor.chargeReactor() end)
+    return
+  end
+
+  if info.status == "warming_up" then
+    if reactorReadyToActivate(info) then
+      pcall(function() reactor.activateReactor() end)
+    end
+    return
   end
 end
 
@@ -485,6 +539,8 @@ local function controllerTick()
     return
   end
 
+  detectStartupNoFlow(info)
+
   local field = getFieldPct(info)
   local sat = getSatPct(info)
   local temp = safeNumber(info.temperature, 0)
@@ -540,6 +596,9 @@ local function startupCheck()
     error("Reactor peripheral did not return reactor info.")
   end
 
+  requireMethod(inputGate, "input gate", "getSignalLowFlow")
+  requireMethod(outputGate, "output gate", "getSignalLowFlow")
+
   pcall(function() inputGate.getSignalLowFlow() end)
   pcall(function() outputGate.getSignalLowFlow() end)
 
@@ -591,11 +650,15 @@ local function doStart()
     print("Cannot start: emergency is latched. Use 'reset' first.")
     return
   end
+
   state.autoMode = true
   state.emergency = false
+  state.startupComplete = false
+  state.startupNoFlowTicks = 0
+
   pcall(function() reactor.chargeReactor() end)
-  pcall(function() reactor.activateReactor() end)
-  print("Start sequence issued.")
+
+  print("Charge sequence issued.")
 end
 
 local function doStop()
