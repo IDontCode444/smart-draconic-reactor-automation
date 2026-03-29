@@ -7,57 +7,58 @@
 --   - Monitor autodetect + monitor touch support
 --   - Large-monitor friendly UI
 --   - Compatibility detection for common reactor/gate methods
---   - Tuned for high-output 75x operation with stronger startup safety
+--   - Retuned for safer ATM10 75x startup and sustained output
 
 local CONFIG = {
   REACTOR_NAME = "draconic_reactor_0",
   INPUT_GATE_NAME = "flow_gate_0",
   OUTPUT_GATE_NAME = "flow_gate_1",
 
-  LOOP_INTERVAL = 0.25,
+  LOOP_INTERVAL = 0.10,
   UI_REFRESH = 0.20,
   MONITOR_TEXT_SCALE = 0.5,
 
   TARGET_TEMP = 8000,
-  TARGET_SAT = 0.45,
+  TARGET_SAT = 0.42,
   FIELD_TARGET_OPTIONS = { 0.45, 0.50, 0.55, 0.60 },
   DEFAULT_FIELD_TARGET = 0.50,
 
-  CHARGE_INFLOW = 40000000,
-  STARTUP_HOLD_SECONDS = 18,
-  RAMP_SECONDS = 240,
-  RAMP_START_FIELD = 0.88,
-  RAMP_START_SAT = 0.92,
+  CHARGE_INFLOW = 150000000,
+  STARTUP_PRIME_INPUT = 300000000,
+  STARTUP_HOLD_SECONDS = 24,
+  RAMP_SECONDS = 300,
+  RAMP_START_FIELD = 0.82,
+  RAMP_START_SAT = 0.88,
 
-  ACTIVATE_MIN_FIELD = 0.75,
-  ACTIVATE_MIN_SAT = 0.85,
+  ACTIVATE_MIN_FIELD = 0.98,
+  ACTIVATE_MIN_SAT = 0.98,
 
   SCRAM_TEMP = 8650,
   SCRAM_FIELD = 0.22,
   SCRAM_SAT = 0.10,
   SCRAM_NO_FUEL = 0.002,
-  SCRAM_FIELD_RECOVERY = 0.80,
+  SCRAM_FIELD_RECOVERY = 0.75,
   SCRAM_COOLDOWN_OUTPUT = 0,
 
   TEMP_HIGH_BAND = 8250,
   TEMP_LOW_BAND = 7600,
-  SAT_SOFT_LOW = 0.30,
+  SAT_SOFT_LOW = 0.28,
   SAT_SOFT_HIGH = 0.85,
 
-  MAX_INPUT = 100000000,
-  MAX_OUTPUT = 240000000,
+  MAX_INPUT = 400000000,
+  MAX_OUTPUT = 260000000,
   DRAW_SCALE = 1.0,
 
   PID_INPUT = {
-    kp = 2.30, ki = 0.18, kd = 0.55,
-    min = -40000000, max = 50000000,
-    integralMin = -50000000, integralMax = 50000000,
+    kp = 1.65, ki = 0.10, kd = 0.20,
+    min = -120000000, max = 250000000,
+    integralMin = -250000000, integralMax = 250000000,
   },
 
   PID_OUTPUT = {
-    kp = 1.55, ki = 0.14, kd = 0.55,
-    min = 0, max = 240000000,
-    integralMin = -80000000, integralMax = 80000000,
+    kp = 1.25, ki = 0.08, kd = 0.30,
+    min = 0, max = 260000000,
+    integralMin = -120000000, integralMax = 120000000,
   },
 }
 
@@ -461,7 +462,12 @@ local function calcFieldFeedForward(info, targetField)
 end
 
 local function getSoftFieldLow()
-  return math.max(0.40, state.targetField - 0.08)
+  return math.max(0.38, state.targetField - 0.06)
+end
+
+local function reactorIsChargedEnough(info)
+  if not info then return false end
+  return info.status == "charged" or (info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD and info.satPct >= CONFIG.ACTIVATE_MIN_SAT)
 end
 
 local function shouldScram(info)
@@ -529,11 +535,13 @@ local function updateCharging(info)
   state.scramArmed = false
   setFlows(CONFIG.CHARGE_INFLOW, 0)
 
-  if info.status == "charged" or (info.fieldPct >= CONFIG.ACTIVATE_MIN_FIELD and info.satPct >= CONFIG.ACTIVATE_MIN_SAT) then
+  if reactorIsChargedEnough(info) then
     state.mode = "STARTING"
     state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
     state.rampStart = now()
     state.scramArmed = false
+
+    setFlows(CONFIG.STARTUP_PRIME_INPUT, 0)
 
     local ok, err = callReactor("activate")
     if ok then
@@ -579,8 +587,9 @@ local function updateRunning(info, dt)
 
   if state.mode == "STARTING" then
     if now() < (state.holdUntil or 0) then
-      local startupField = math.max(fieldTarget, 0.90)
-      setFlows(calcFieldFeedForward(info, startupField), 0)
+      local startupField = math.max(fieldTarget, CONFIG.RAMP_START_FIELD)
+      local startupInput = math.max(calcFieldFeedForward(info, startupField), CONFIG.STARTUP_PRIME_INPUT)
+      setFlows(startupInput, 0)
       return
     else
       state.mode = "RUNNING"
@@ -597,52 +606,54 @@ local function updateRunning(info, dt)
   local outputCmd = stepPID(pidOutput, satError, dt)
 
   if info.temperature < CONFIG.TEMP_LOW_BAND then
-    outputCmd = outputCmd * 0.20
+    outputCmd = outputCmd * 0.10
   elseif info.temperature < CONFIG.TARGET_TEMP then
     outputCmd = outputCmd * clamp(
       (info.temperature - CONFIG.TEMP_LOW_BAND) / math.max(1, (CONFIG.TARGET_TEMP - CONFIG.TEMP_LOW_BAND)),
-      0.20, 1.0
+      0.10, 1.0
     )
   elseif info.temperature > CONFIG.TEMP_HIGH_BAND then
     local extra = (info.temperature - CONFIG.TEMP_HIGH_BAND) / math.max(1, (CONFIG.SCRAM_TEMP - CONFIG.TEMP_HIGH_BAND))
-    outputCmd = clamp(outputCmd + extra * CONFIG.MAX_OUTPUT * 0.35, 0, CONFIG.MAX_OUTPUT)
+    outputCmd = clamp(outputCmd + extra * CONFIG.MAX_OUTPUT * 0.30, 0, CONFIG.MAX_OUTPUT)
   end
 
   if info.fieldPct < getSoftFieldLow() then
-    outputCmd = outputCmd * 0.20
-    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, math.max(fieldTarget, 0.70)))
+    outputCmd = outputCmd * 0.15
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, math.max(fieldTarget, 0.68)))
   end
 
-  if info.fieldPct < 0.45 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.08)
-    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.85))
-  elseif info.fieldPct < 0.55 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.22)
+  if info.fieldPct < 0.30 then
+    outputCmd = 0
     inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.75))
-  elseif info.fieldPct < 0.65 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.45)
+  elseif info.fieldPct < 0.40 then
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.03)
+    inputCmd = math.max(inputCmd, calcFieldFeedForward(info, 0.70))
+  elseif info.fieldPct < 0.50 then
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.12)
+  elseif info.fieldPct < 0.60 then
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.35)
   end
 
   if info.satPct < CONFIG.SAT_SOFT_LOW then
-    outputCmd = outputCmd * 0.12
+    outputCmd = outputCmd * 0.10
   elseif info.satPct < satTarget then
     local satScale = clamp(
       (info.satPct - CONFIG.SAT_SOFT_LOW) / math.max(0.01, (satTarget - CONFIG.SAT_SOFT_LOW)),
-      0.15, 1.0
+      0.12, 1.0
     )
     outputCmd = outputCmd * satScale
   elseif info.satPct > CONFIG.SAT_SOFT_HIGH then
-    outputCmd = math.max(outputCmd, CONFIG.MAX_OUTPUT * 0.70)
+    outputCmd = math.max(outputCmd, CONFIG.MAX_OUTPUT * 0.65)
   end
 
   if rampProgress < 0.20 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.10)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.05)
   elseif rampProgress < 0.40 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.25)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.18)
   elseif rampProgress < 0.60 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.45)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.35)
   elseif rampProgress < 0.80 then
-    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.70)
+    outputCmd = math.min(outputCmd, CONFIG.MAX_OUTPUT * 0.60)
   end
 
   outputCmd = outputCmd * clamp(rampProgress, 0.05, 1.0) * state.manualOutputBias
@@ -663,7 +674,7 @@ local function updateController()
   end
 
   local t = now()
-  local dt = math.max(0.05, t - state.lastLoopAt)
+  local dt = math.max(0.02, t - state.lastLoopAt)
   state.lastLoopAt = t
 
   local kill, reason = shouldScram(info)
@@ -727,6 +738,7 @@ local function drawUI()
   if state.mode == "RUNNING" then modeColor = colors.lime end
   if state.mode == "SCRAM" then modeColor = colors.red end
   if state.mode == "STOPPING" then modeColor = colors.orange end
+  if state.mode == "STARTING" then modeColor = colors.orange end
 
   writeAt(2, 3, "Mode: ", colors.lightGray)
   writeAt(8, 3, state.mode, modeColor)
@@ -806,12 +818,22 @@ local function doCharge()
 end
 
 local function doStart()
+  local info = state.lastInfo
+
+  if not reactorIsChargedEnough(info) then
+    pushLog("Start blocked: reactor not fully charged")
+    state.mode = "CHARGING"
+    return
+  end
+
   resetAllPIDs()
   state.scramReason = nil
   state.scramArmed = false
   state.mode = "STARTING"
   state.holdUntil = now() + CONFIG.STARTUP_HOLD_SECONDS
   state.rampStart = now()
+
+  setFlows(CONFIG.STARTUP_PRIME_INPUT, 0)
 
   local ok, err = callReactor("activate")
   if ok then
@@ -889,8 +911,9 @@ local function bootstrap()
     end
   end
 
-  pushLog("Targets: 8000C / variable field / 45% sat")
+  pushLog("Targets: 8000C / variable field / 42% sat")
   pushLog("Default field target: 50%")
+  pushLog("75x startup retune loaded")
   if usingMonitor then
     pushLog("Monitor touch enabled")
   end
