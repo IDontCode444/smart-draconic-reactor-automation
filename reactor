@@ -1,12 +1,8 @@
 --========================================================
--- Draconic Reactor Controller - safer activation build
+-- Draconic Reactor Controller - adaptive input build
 -- Auto-detect reactor + monitor
 -- Manual naming for input/output gates only
 --========================================================
-
-----------------------------
--- USER CONFIG
-----------------------------
 
 local CFG = {
   inputGateName  = "flow_gate_0",
@@ -16,18 +12,17 @@ local CFG = {
   tickRate = 0.10,
   title = "Draconic Reactor Control",
 
-  -- Pre-activation readiness
+  -- Startup readiness in charge mode
   startupReadyField = 0.49,
   startupReadySat   = 0.49,
   startupReadyTemp  = 2000,
 
   -- Ignition behavior
   chargeInput       = 12000000,
-  ignitionInput     = 25000000, -- force max protection on activation
   ignitionOutput    = 0,
-  ignitionMinTime   = 12.0,
-  ignitionExitField = 0.40,
-  ignitionExitSat   = 0.20,
+  ignitionMinTime   = 8.0,
+  ignitionExitField = 0.35,
+  ignitionExitSat   = 0.15,
 
   -- Running targets
   targetTemp        = 7800,
@@ -48,7 +43,7 @@ local CFG = {
 
   -- Limits
   minInput = 250000,
-  maxInput = 25000000,
+  inputSanityCeiling = 2000000000, -- effectively "no limit", just overflow protection
   minOutput = 0,
   maxOutput = 20000000,
 
@@ -61,7 +56,7 @@ local CFG = {
     integralMax =  0.20,
   },
 
-  -- Output PID = saturation control
+  -- Output PID = saturation / temperature control
   outputPID = {
     kp = 14000000,
     ki = 1200000,
@@ -73,10 +68,6 @@ local CFG = {
   buttonDebounce = 0.20,
 }
 
-----------------------------
--- COLORS
-----------------------------
-
 local UI = {
   bg = colors.black,
   fg = colors.white,
@@ -87,17 +78,13 @@ local UI = {
   bad = colors.red,
 }
 
-----------------------------
--- STATE
-----------------------------
-
 local reactorName, reactor
 local monitorName, mon
 local inputGate, outputGate
 
 local state = {
   screen = "main",
-  phase = "IDLE", -- IDLE / CHARGING / READY / IGNITION HOLD / RUNNING / AUTO SHUTDOWN / SCRAM
+  phase = "IDLE",
   message = "Booting...",
   lastInfo = nil,
 
@@ -115,10 +102,6 @@ local state = {
   inputPID = { integral = 0, lastError = 0 },
   outputPID = { integral = 0, lastError = 0 },
 }
-
-----------------------------
--- HELPERS
-----------------------------
 
 local function clamp(v, lo, hi)
   if v < lo then return lo end
@@ -211,10 +194,6 @@ local function hitButton(map, x, y)
   return nil
 end
 
-----------------------------
--- PERIPHERAL DETECTION
-----------------------------
-
 local function isMonitorPeripheral(name)
   local p = peripheral.wrap(name)
   return p
@@ -261,10 +240,6 @@ local function bindPeripherals()
   if not outputGate then error("Missing output gate: " .. tostring(CFG.outputGateName)) end
 end
 
-----------------------------
--- REACTOR ACCESSORS
-----------------------------
-
 local function getInfo()
   local info = safeCall(reactor, "getReactorInfo")
   if type(info) == "table" then return info end
@@ -272,15 +247,15 @@ local function getInfo()
 end
 
 local function getStatus(info)
-  return info.status or info.reactorState or "unknown"
+  return info.status or info.reactorState or info.state or "unknown"
 end
 
 local function getField(info)
-  return info.fieldStrength or info.shieldCharge or 0
+  return info.fieldStrength or info.shieldCharge or info.fieldCharge or 0
 end
 
 local function getMaxField(info)
-  return info.maxFieldStrength or info.maxShieldCharge or 1
+  return info.maxFieldStrength or info.maxShieldCharge or info.maxFieldCharge or 1
 end
 
 local function getFieldPct(info)
@@ -290,11 +265,11 @@ local function getFieldPct(info)
 end
 
 local function getSaturation(info)
-  return info.energySaturation or info.saturation or 0
+  return info.energySaturation or info.saturation or info.coreSaturation or 0
 end
 
 local function getMaxSaturation(info)
-  return info.maxEnergySaturation or info.maxSaturation or 1
+  return info.maxEnergySaturation or info.maxSaturation or info.maxCoreSaturation or 1
 end
 
 local function getSaturationPct(info)
@@ -304,26 +279,53 @@ local function getSaturationPct(info)
 end
 
 local function getTemp(info)
-  return info.temperature or 0
+  return info.temperature or info.temp or 0
 end
 
 local function getGeneration(info)
-  return info.generationRate or info.genRate or 0
+  return info.generationRate or info.genRate or info.outputRate or 0
 end
 
 local function getFieldDrain(info)
-  return info.fieldDrainRate or info.fieldInputRate or 0
+  return info.fieldDrainRate
+      or info.fieldInputRate
+      or info.fieldDrain
+      or info.shieldDrain
+      or info.shieldInputRate
+      or 0
 end
 
 local function getFuel(info)
-  return info.reactableFuel or info.fuelConversion or info.fuel or 0
+  return info.reactableFuel or info.fuelConversion or info.fuel or info.convertedFuel or 0
 end
 
-local function isOnline(info)
-  local s = string.lower(tostring(getStatus(info)))
+local function statusLooksOnline(status)
+  local s = string.lower(tostring(status or ""))
   return s:find("online") ~= nil
       or s:find("running") ~= nil
       or s:find("active") ~= nil
+end
+
+local function isOnline(info)
+  local status = getStatus(info)
+  if statusLooksOnline(status) then
+    return true
+  end
+
+  local temp = getTemp(info)
+  local drain = getFieldDrain(info)
+  local fieldPct = getFieldPct(info)
+  local satPct = getSaturationPct(info)
+
+  if temp >= CFG.startupReadyTemp and drain > 0 then
+    return true
+  end
+
+  if temp >= CFG.startupReadyTemp and fieldPct > 0 and satPct > 0 and tostring(status) ~= "cold" then
+    return true
+  end
+
+  return false
 end
 
 local function isStartupReady(info)
@@ -332,10 +334,6 @@ local function isStartupReady(info)
      and getTemp(info) >= CFG.startupReadyTemp
 end
 
-----------------------------
--- GATE CONTROL
-----------------------------
-
 local function setGateFlow(gate, rate)
   rate = math.max(0, math.floor(rate or 0))
 
@@ -343,13 +341,8 @@ local function setGateFlow(gate, rate)
   if safeCall(gate, "setSignalLowFlow", rate) ~= nil then return true end
   if safeCall(gate, "setFlowOverride", rate) ~= nil then return true end
   if safeCall(gate, "setTransferRate", rate) ~= nil then return true end
-
   return false
 end
-
-----------------------------
--- PID
-----------------------------
 
 local function resetPID()
   state.inputPID.integral = 0
@@ -371,9 +364,13 @@ local function pidStep(pidState, pidCfg, error, dt)
        + (pidCfg.kd * derivative)
 end
 
-----------------------------
--- COMMANDS
-----------------------------
+local function adaptiveInput(baseDemand, extraDemand)
+  local v = math.max(CFG.minInput, (baseDemand or 0) + (extraDemand or 0))
+  if v > CFG.inputSanityCeiling then
+    v = CFG.inputSanityCeiling
+  end
+  return v
+end
 
 local function doCharge()
   state.autoShutdown = false
@@ -396,8 +393,8 @@ local function doActivate()
     return
   end
 
-  -- Force protection before and during activation
-  state.desiredInput = CFG.ignitionInput
+  local drain = getFieldDrain(info)
+  state.desiredInput = adaptiveInput(drain * 1.50, 10000000)
   state.desiredOutput = 0
   setGateFlow(inputGate, state.desiredInput)
   setGateFlow(outputGate, 0)
@@ -407,36 +404,37 @@ local function doActivate()
   state.startupActivatedAt = os.clock()
   resetPID()
   state.phase = "IGNITION HOLD"
-  state.message = "Activation requested; hard hold engaged"
+  state.message = "Activation requested; adaptive hold engaged"
 end
 
 local function doScram(reason)
+  local info = state.lastInfo or {}
+  local drain = getFieldDrain(info)
   state.phase = "SCRAM"
   state.autoShutdown = false
   state.startupActivatedAt = nil
-  state.desiredInput = CFG.maxInput
+  state.desiredInput = adaptiveInput(drain * 2.00, 20000000)
   state.desiredOutput = 0
-  setGateFlow(inputGate, CFG.maxInput)
+  setGateFlow(inputGate, state.desiredInput)
   setGateFlow(outputGate, 0)
   safeCall(reactor, "stopReactor")
   state.message = reason or "SCRAM engaged"
 end
-
-----------------------------
--- CONTROL
-----------------------------
 
 local function cooldownControl(info)
   local fieldPct = getFieldPct(info)
   local drain = getFieldDrain(info)
   local temp = getTemp(info)
 
-  local desiredInput = math.max(CFG.cooldownInputMin, drain * 1.20)
+  local extra = 0
   if fieldPct < CFG.cooldownFieldTarget then
-    desiredInput = desiredInput * 1.20
+    extra = extra + ((CFG.cooldownFieldTarget - fieldPct) * 12000000)
+  end
+  if temp > CFG.cooldownSafeTemp then
+    extra = extra + 2000000
   end
 
-  desiredInput = clamp(desiredInput, CFG.minInput, CFG.maxInput)
+  local desiredInput = adaptiveInput(math.max(CFG.cooldownInputMin, drain * 1.20), extra)
 
   state.desiredInput = desiredInput
   state.desiredOutput = 0
@@ -464,18 +462,32 @@ local function ignitionHoldControl(info)
 
   local fieldPct = getFieldPct(info)
   local satPct = getSaturationPct(info)
+  local temp = getTemp(info)
+  local drain = getFieldDrain(info)
+  local online = isOnline(info)
 
-  state.desiredInput = CFG.ignitionInput
-  state.desiredOutput = CFG.ignitionOutput
+  local extra = 15000000
+  if fieldPct < 0.50 then
+    extra = extra + ((0.50 - fieldPct) * 20000000)
+  end
+  if satPct < 0.50 then
+    extra = extra + ((0.50 - satPct) * 8000000)
+  end
+  if temp > CFG.targetTemp then
+    extra = extra + 4000000
+  end
+
+  state.desiredInput = adaptiveInput(drain * 1.35, extra)
+  state.desiredOutput = 0
   setGateFlow(inputGate, state.desiredInput)
-  setGateFlow(outputGate, state.desiredOutput)
+  setGateFlow(outputGate, 0)
 
-  if fieldPct <= CFG.scramField or satPct <= CFG.scramSaturation or getTemp(info) >= CFG.scramTemp then
+  if fieldPct <= CFG.scramField or satPct <= CFG.scramSaturation or temp >= CFG.scramTemp then
     doScram("SCRAM during ignition hold")
     return
   end
 
-  if not isOnline(info) then
+  if not online then
     state.message = "Waiting for online state..."
     return
   end
@@ -528,22 +540,19 @@ local function runningControl(info, dt)
     return
   end
 
-  -- Input PID: hold field near target
   local fieldError = CFG.targetField - fieldPct
-  local inputBase = math.max(CFG.minInput, drain * 1.08)
   local inputAdjust = pidStep(state.inputPID, CFG.inputPID, fieldError, dt)
-  local desiredInput = inputBase + inputAdjust
 
+  local extraInput = inputAdjust
   if fieldPct < CFG.targetField then
-    desiredInput = desiredInput + ((CFG.targetField - fieldPct) * 10000000)
+    extraInput = extraInput + ((CFG.targetField - fieldPct) * 10000000)
   end
   if temp > CFG.targetTemp then
-    desiredInput = desiredInput + 2000000
+    extraInput = extraInput + 2000000
   end
 
-  desiredInput = clamp(desiredInput, CFG.minInput, CFG.maxInput)
+  local desiredInput = adaptiveInput(drain * 1.08, extraInput)
 
-  -- Output PID: hold saturation, then trim for temperature
   local satError = satPct - CFG.targetSaturation
   local outputBase = clamp(gen * 0.60, CFG.minOutput, CFG.maxOutput)
   local outputAdjust = pidStep(state.outputPID, CFG.outputPID, satError, dt)
@@ -581,9 +590,10 @@ local function updateControl(info)
   lastTickClock = now
 
   if state.phase == "SCRAM" then
-    state.desiredInput = CFG.maxInput
+    local drain = getFieldDrain(info)
+    state.desiredInput = adaptiveInput(drain * 2.00, 20000000)
     state.desiredOutput = 0
-    setGateFlow(inputGate, CFG.maxInput)
+    setGateFlow(inputGate, state.desiredInput)
     setGateFlow(outputGate, 0)
     state.netGain = getGeneration(info) - state.desiredInput
     return
@@ -597,7 +607,7 @@ local function updateControl(info)
 
   if state.phase == "IGNITION HOLD" then
     ignitionHoldControl(info)
-    state.netGain = getGeneration(info) - state.desiredInput
+    state.netGain = getGeneration(info) - state.desiredInput - state.desiredOutput
     return
   end
 
@@ -623,7 +633,6 @@ local function updateControl(info)
     return
   end
 
-  -- stay in charge mode safely
   state.phase = "CHARGING"
   state.desiredInput = CFG.chargeInput
   state.desiredOutput = 0
@@ -632,10 +641,6 @@ local function updateControl(info)
   safeCall(reactor, "chargeReactor")
   state.message = "Charging reactor"
 end
-
-----------------------------
--- DRAW
-----------------------------
 
 local function fieldColor(v)
   if v <= CFG.scramField then return UI.bad end
@@ -673,31 +678,33 @@ local function drawMain(info)
   local drain = getFieldDrain(info)
   local fuel = getFuel(info)
   local status = tostring(getStatus(info))
+  local online = isOnline(info)
 
   centerText(1, CFG.title, UI.accent, UI.bg)
   writeAt(1, 2, string.rep("-", w), UI.dim, UI.bg)
 
   writeAt(1, 3, "Phase: " .. state.phase, UI.accent, UI.bg)
-  writeAt(1, 4, "Status: " .. status, UI.dim, UI.bg)
-  writeAt(1, 5, "Message: " .. tostring(state.message), UI.dim, UI.bg)
+  writeAt(1, 4, "Raw Status: " .. status, UI.dim, UI.bg)
+  writeAt(1, 5, "Derived Online: " .. tostring(online), online and UI.good or UI.warn, UI.bg)
+  writeAt(1, 6, "Message: " .. tostring(state.message), UI.dim, UI.bg)
 
-  writeAt(1, 7, "Field: " .. fmtPct(fieldPct), fieldColor(fieldPct), UI.bg)
-  progressBar(1, 8, w, fieldPct, colors.blue, colors.gray)
+  writeAt(1, 8, "Field: " .. fmtPct(fieldPct), fieldColor(fieldPct), UI.bg)
+  progressBar(1, 9, w, fieldPct, colors.blue, colors.gray)
 
-  writeAt(1, 10, "Saturation: " .. fmtPct(satPct), satColor(satPct), UI.bg)
-  progressBar(1, 11, w, satPct, colors.green, colors.gray)
+  writeAt(1, 11, "Saturation: " .. fmtPct(satPct), satColor(satPct), UI.bg)
+  progressBar(1, 12, w, satPct, colors.green, colors.gray)
 
-  writeAt(1, 13, "Temp: " .. fmtInt(temp) .. " C", tempColor(temp), UI.bg)
-  writeAt(1, 14, "Generation: " .. fmtInt(gen) .. " RF/t", UI.good, UI.bg)
-  writeAt(1, 15, "Field Drain: " .. fmtInt(drain) .. " RF/t", UI.warn, UI.bg)
-  writeAt(1, 16, "Input Gate: " .. fmtInt(state.desiredInput) .. " RF/t", UI.accent, UI.bg)
-  writeAt(1, 17, "Output Gate: " .. fmtInt(state.desiredOutput) .. " RF/t", UI.accent, UI.bg)
-  writeAt(1, 18, "Net Gain: " .. fmtInt(state.netGain) .. " RF/t", netColor(state.netGain), UI.bg)
-  writeAt(1, 19, "Fuel: " .. string.format("%.2f", fuel), UI.fg, UI.bg)
+  writeAt(1, 14, "Temp: " .. fmtInt(temp) .. " C", tempColor(temp), UI.bg)
+  writeAt(1, 15, "Generation: " .. fmtInt(gen) .. " RF/t", UI.good, UI.bg)
+  writeAt(1, 16, "Field Input/Drain: " .. fmtInt(drain) .. " RF/t", UI.warn, UI.bg)
+  writeAt(1, 17, "Input Gate: " .. fmtInt(state.desiredInput) .. " RF/t", UI.accent, UI.bg)
+  writeAt(1, 18, "Output Gate: " .. fmtInt(state.desiredOutput) .. " RF/t", UI.accent, UI.bg)
+  writeAt(1, 19, "Net Gain: " .. fmtInt(state.netGain) .. " RF/t", netColor(state.netGain), UI.bg)
+  writeAt(1, 20, "Fuel: " .. string.format("%.2f", fuel), UI.fg, UI.bg)
 
-  writeAt(1, 21, "Target Temp: " .. fmtInt(CFG.targetTemp) .. " C", UI.dim, UI.bg)
-  writeAt(1, 22, "Target Field: " .. fmtPct(CFG.targetField), UI.dim, UI.bg)
-  writeAt(1, 23, "Target Saturation: " .. fmtPct(CFG.targetSaturation), UI.dim, UI.bg)
+  writeAt(1, 22, "Target Temp: " .. fmtInt(CFG.targetTemp) .. " C", UI.dim, UI.bg)
+  writeAt(1, 23, "Target Field: " .. fmtPct(CFG.targetField), UI.dim, UI.bg)
+  writeAt(1, 24, "Target Saturation: " .. fmtPct(CFG.targetSaturation), UI.dim, UI.bg)
 
   local by = h - 2
   local bw = math.floor(w / 4)
@@ -756,10 +763,6 @@ local function redraw()
   end
 end
 
-----------------------------
--- TOUCH
-----------------------------
-
 local function handleMainTouch(x, y)
   local now = os.clock()
   if now - state.lastTouch < CFG.buttonDebounce then return end
@@ -811,10 +814,6 @@ local function handleTuneTouch(x, y)
   if id == "sat_p5" then CFG.targetSaturation = clamp(CFG.targetSaturation + 0.05, 0.35, 0.90) end
 end
 
-----------------------------
--- INIT
-----------------------------
-
 bindPeripherals()
 mon.setTextScale(CFG.monitorScale)
 clearMonitor()
@@ -822,10 +821,6 @@ clearMonitor()
 setGateFlow(inputGate, 0)
 setGateFlow(outputGate, 0)
 state.message = "Reactor: " .. reactorName .. " | Monitor: " .. monitorName
-
-----------------------------
--- LOOP
-----------------------------
 
 local tickTimer = os.startTimer(CFG.tickRate)
 
