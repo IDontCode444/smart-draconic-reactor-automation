@@ -1,5 +1,5 @@
 --========================================================
--- Draconic Reactor Controller - MANUAL START VERSION
+-- Draconic Reactor Controller - MANUAL START + FIXED READOUT
 -- Auto-detect reactor + monitor
 -- Manual naming for input/output gates only
 --========================================================
@@ -66,6 +66,8 @@ local CFG = {
   },
 
   buttonDebounce = 0.20,
+
+  showDebugKeys = true,
 }
 
 local UI = {
@@ -87,6 +89,7 @@ local state = {
   phase = "IDLE",
   message = "Booting...",
   lastInfo = nil,
+  lastNormalized = nil,
 
   desiredInput = 0,
   desiredOutput = 0,
@@ -110,7 +113,15 @@ local function clamp(v, lo, hi)
   return v
 end
 
-local function round(n) return math.floor(n + 0.5) end
+local function round(n) return math.floor((tonumber(n) or 0) + 0.5) end
+
+local function toNum(v)
+  local n = tonumber(v)
+  if n == nil then return nil end
+  if n ~= n then return nil end
+  if n == math.huge or n == -math.huge then return nil end
+  return n
+end
 
 local function fmtInt(n)
   n = tonumber(n or 0) or 0
@@ -247,57 +258,216 @@ local function getInfo()
   return nil
 end
 
+local function normalizeStatus(s)
+  s = tostring(s or "unknown")
+  local t = string.lower(s)
+  t = t:gsub("%s+", "_")
+  return t, s
+end
+
+local function getAny(info, names)
+  for _, k in ipairs(names) do
+    local v = info[k]
+    local n = toNum(v)
+    if n ~= nil then
+      return n, k
+    end
+  end
+  return nil, nil
+end
+
+local function choosePair(info, pairs)
+  local best = nil
+
+  for _, pair in ipairs(pairs) do
+    local cur = toNum(info[pair[1]])
+    local max = toNum(info[pair[2]])
+
+    if cur and max and max > 0 then
+      local pct = cur / max
+      local score = 0
+
+      if pct >= 0 and pct <= 1.05 then score = score + 100 end
+      if cur > 0 then score = score + 10 end
+      if max > 1 then score = score + 5 end
+
+      if not best or score > best.score then
+        best = {
+          value = cur,
+          max = max,
+          pct = clamp(pct, 0, 1),
+          valueKey = pair[1],
+          maxKey = pair[2],
+          score = score,
+        }
+      end
+    end
+  end
+
+  return best
+end
+
+local function normalizeInfo(info)
+  local statusNorm, statusRaw = normalizeStatus(info.status or info.reactorState or info.state or "unknown")
+
+  local temp, tempKey = getAny(info, {
+    "temperature", "temp", "coreTemperature"
+  })
+  temp = temp or 0
+
+  local gen, genKey = getAny(info, {
+    "generationRate", "genRate", "outputRate", "generation", "output"
+  })
+  gen = gen or 0
+
+  local drain, drainKey = getAny(info, {
+    "fieldDrainRate", "fieldInputRate", "fieldDrain", "shieldDrain",
+    "shieldInputRate", "drainRate"
+  })
+  drain = drain or 0
+
+  local field = choosePair(info, {
+    {"fieldStrength", "maxFieldStrength"},
+    {"shieldCharge", "maxShieldCharge"},
+    {"fieldCharge", "maxFieldCharge"},
+    {"shieldStrength", "maxShieldStrength"},
+    {"shield", "maxShield"},
+  })
+
+  local sat = choosePair(info, {
+    {"energySaturation", "maxEnergySaturation"},
+    {"saturation", "maxSaturation"},
+    {"coreSaturation", "maxCoreSaturation"},
+    {"energy", "maxEnergy"},
+  })
+
+  if not field then
+    local v, vk = getAny(info, {"fieldStrength", "shieldCharge", "fieldCharge", "shieldStrength", "shield"})
+    local m, mk = getAny(info, {"maxFieldStrength", "maxShieldCharge", "maxFieldCharge", "maxShieldStrength", "maxShield"})
+    if v and m and m > 0 then
+      field = { value = v, max = m, pct = clamp(v / m, 0, 1), valueKey = vk, maxKey = mk }
+    end
+  end
+
+  if not sat then
+    local v, vk = getAny(info, {"energySaturation", "saturation", "coreSaturation", "energy"})
+    local m, mk = getAny(info, {"maxEnergySaturation", "maxSaturation", "maxCoreSaturation", "maxEnergy"})
+    if v and m and m > 0 then
+      sat = { value = v, max = m, pct = clamp(v / m, 0, 1), valueKey = vk, maxKey = mk }
+    end
+  end
+
+  local fuelRemaining = nil
+  local fuelMax = nil
+  local fuelDisplayKey = "unknown"
+
+  local fuelConv = toNum(info.fuelConversion)
+  local maxFuelConv = toNum(info.maxFuelConversion)
+  local reactableFuel = toNum(info.reactableFuel)
+  local fuel = toNum(info.fuel)
+  local convertedFuel = toNum(info.convertedFuel)
+
+  if fuelConv and maxFuelConv and maxFuelConv > 0 then
+    fuelRemaining = math.max(0, maxFuelConv - fuelConv)
+    fuelMax = maxFuelConv
+    fuelDisplayKey = "maxFuelConversion-fuelConversion"
+  elseif reactableFuel and reactableFuel >= 0 then
+    fuelRemaining = reactableFuel
+    fuelMax = reactableFuel
+    fuelDisplayKey = "reactableFuel"
+  elseif fuel and fuel >= 0 then
+    fuelRemaining = fuel
+    fuelMax = fuel
+    fuelDisplayKey = "fuel"
+  elseif convertedFuel and convertedFuel >= 0 then
+    fuelRemaining = convertedFuel
+    fuelMax = convertedFuel
+    fuelDisplayKey = "convertedFuel"
+  else
+    fuelRemaining = 0
+    fuelMax = 1
+    fuelDisplayKey = "fallback0"
+  end
+
+  local fuelPct = 0
+  if fuelMax and fuelMax > 0 then
+    fuelPct = clamp(fuelRemaining / fuelMax, 0, 1)
+  end
+
+  return {
+    status = statusRaw,
+    statusNorm = statusNorm,
+
+    temp = temp,
+    tempKey = tempKey or "fallback0",
+
+    generation = gen,
+    generationKey = genKey or "fallback0",
+
+    fieldDrain = drain,
+    fieldDrainKey = drainKey or "fallback0",
+
+    field = field and field.value or 0,
+    maxField = field and field.max or 1,
+    fieldPct = field and field.pct or 0,
+    fieldKeys = field and (field.valueKey .. "/" .. field.maxKey) or "fallback0",
+
+    saturation = sat and sat.value or 0,
+    maxSaturation = sat and sat.max or 1,
+    saturationPct = sat and sat.pct or 0,
+    saturationKeys = sat and (sat.valueKey .. "/" .. sat.maxKey) or "fallback0",
+
+    fuel = fuelRemaining,
+    fuelMax = fuelMax or 1,
+    fuelPct = fuelPct,
+    fuelKey = fuelDisplayKey,
+
+    raw = info,
+  }
+end
+
 local function getStatus(info)
-  return info.status or info.reactorState or info.state or "unknown"
+  return normalizeInfo(info).status
 end
 
 local function getField(info)
-  return info.fieldStrength or info.shieldCharge or info.fieldCharge or 0
+  return normalizeInfo(info).field
 end
 
 local function getMaxField(info)
-  return info.maxFieldStrength or info.maxShieldCharge or info.maxFieldCharge or 1
+  return normalizeInfo(info).maxField
 end
 
 local function getFieldPct(info)
-  local m = getMaxField(info)
-  if m == 0 then return 0 end
-  return getField(info) / m
+  return normalizeInfo(info).fieldPct
 end
 
 local function getSaturation(info)
-  return info.energySaturation or info.saturation or info.coreSaturation or 0
+  return normalizeInfo(info).saturation
 end
 
 local function getMaxSaturation(info)
-  return info.maxEnergySaturation or info.maxSaturation or info.maxCoreSaturation or 1
+  return normalizeInfo(info).maxSaturation
 end
 
 local function getSaturationPct(info)
-  local m = getMaxSaturation(info)
-  if m == 0 then return 0 end
-  return getSaturation(info) / m
+  return normalizeInfo(info).saturationPct
 end
 
 local function getTemp(info)
-  return info.temperature or info.temp or 0
+  return normalizeInfo(info).temp
 end
 
 local function getGeneration(info)
-  return info.generationRate or info.genRate or info.outputRate or 0
+  return normalizeInfo(info).generation
 end
 
 local function getFieldDrain(info)
-  return info.fieldDrainRate
-      or info.fieldInputRate
-      or info.fieldDrain
-      or info.shieldDrain
-      or info.shieldInputRate
-      or 0
+  return normalizeInfo(info).fieldDrain
 end
 
 local function getFuel(info)
-  return info.reactableFuel or info.fuelConversion or info.fuel or info.convertedFuel or 0
+  return normalizeInfo(info).fuel
 end
 
 local function statusLooksOnline(status)
@@ -308,21 +478,18 @@ local function statusLooksOnline(status)
 end
 
 local function isOnline(info)
-  local status = getStatus(info)
-  if statusLooksOnline(status) then
+  local ni = normalizeInfo(info)
+  local s = ni.statusNorm
+
+  if s == "warming_up" or s == "warmingup" or s == "charged" or s == "charging" or s == "cold" or s == "stopping" then
+    return false
+  end
+
+  if statusLooksOnline(ni.status) then
     return true
   end
 
-  local temp = getTemp(info)
-  local drain = getFieldDrain(info)
-  local fieldPct = getFieldPct(info)
-  local satPct = getSaturationPct(info)
-
-  if temp >= CFG.startupReadyTemp and drain > 0 then
-    return true
-  end
-
-  if temp >= CFG.startupReadyTemp and fieldPct > 0 and satPct > 0 and tostring(status) ~= "cold" then
+  if ni.temp >= CFG.startupReadyTemp and ni.fieldDrain > 0 and ni.generation > 0 then
     return true
   end
 
@@ -330,9 +497,10 @@ local function isOnline(info)
 end
 
 local function isStartupReady(info)
-  return getFieldPct(info) >= CFG.startupReadyField
-     and getSaturationPct(info) >= CFG.startupReadySat
-     and getTemp(info) >= CFG.startupReadyTemp
+  local ni = normalizeInfo(info)
+  return ni.fieldPct >= CFG.startupReadyField
+     and ni.saturationPct >= CFG.startupReadySat
+     and ni.temp >= CFG.startupReadyTemp
 end
 
 local function setGateFlow(gate, rate)
@@ -392,6 +560,8 @@ local function doCharge()
   state.chargeRequested = true
   state.startupActivatedAt = nil
   resetPID()
+  state.desiredInput = CFG.chargeInput
+  state.desiredOutput = 0
   setGateFlow(inputGate, CFG.chargeInput)
   setGateFlow(outputGate, 0)
   safeCall(reactor, "chargeReactor")
@@ -416,8 +586,8 @@ local function doActivate()
     return
   end
 
-  local drain = getFieldDrain(info)
-  state.desiredInput = adaptiveInput(drain * 1.50, 10000000)
+  local ni = normalizeInfo(info)
+  state.desiredInput = adaptiveInput(ni.fieldDrain * 1.50, 10000000)
   state.desiredOutput = 0
   setGateFlow(inputGate, state.desiredInput)
   setGateFlow(outputGate, 0)
@@ -427,17 +597,17 @@ local function doActivate()
   state.startupActivatedAt = os.clock()
   resetPID()
   state.phase = "IGNITION HOLD"
-  state.message = "Activation requested; adaptive hold engaged"
+  state.message = "Activation requested; hold engaged"
 end
 
 local function doScram(reason)
   local info = state.lastInfo or {}
-  local drain = getFieldDrain(info)
+  local ni = normalizeInfo(info)
   state.phase = "SCRAM"
   state.autoShutdown = false
   state.chargeRequested = false
   state.startupActivatedAt = nil
-  state.desiredInput = adaptiveInput(drain * 2.00, 20000000)
+  state.desiredInput = adaptiveInput(ni.fieldDrain * 2.00, 20000000)
   state.desiredOutput = 0
   setGateFlow(inputGate, state.desiredInput)
   setGateFlow(outputGate, 0)
@@ -446,19 +616,17 @@ local function doScram(reason)
 end
 
 local function cooldownControl(info)
-  local fieldPct = getFieldPct(info)
-  local drain = getFieldDrain(info)
-  local temp = getTemp(info)
+  local ni = normalizeInfo(info)
 
   local extra = 0
-  if fieldPct < CFG.cooldownFieldTarget then
-    extra = extra + ((CFG.cooldownFieldTarget - fieldPct) * 12000000)
+  if ni.fieldPct < CFG.cooldownFieldTarget then
+    extra = extra + ((CFG.cooldownFieldTarget - ni.fieldPct) * 12000000)
   end
-  if temp > CFG.cooldownSafeTemp then
+  if ni.temp > CFG.cooldownSafeTemp then
     extra = extra + 2000000
   end
 
-  local desiredInput = adaptiveInput(math.max(CFG.cooldownInputMin, drain * 1.20), extra)
+  local desiredInput = adaptiveInput(math.max(CFG.cooldownInputMin, ni.fieldDrain * 1.20), extra)
 
   state.desiredInput = desiredInput
   state.desiredOutput = 0
@@ -466,7 +634,7 @@ local function cooldownControl(info)
   setGateFlow(outputGate, 0)
   safeCall(reactor, "stopReactor")
 
-  if temp <= CFG.cooldownSafeTemp and not isOnline(info) then
+  if ni.temp <= CFG.cooldownSafeTemp and not isOnline(info) then
     goIdle("Cooldown complete")
   else
     state.message = "Cooling after shutdown"
@@ -474,32 +642,28 @@ local function cooldownControl(info)
 end
 
 local function ignitionHoldControl(info)
+  local ni = normalizeInfo(info)
   local now = os.clock()
   local elapsed = now - (state.startupActivatedAt or now)
-
-  local fieldPct = getFieldPct(info)
-  local satPct = getSaturationPct(info)
-  local temp = getTemp(info)
-  local drain = getFieldDrain(info)
   local online = isOnline(info)
 
   local extra = 15000000
-  if fieldPct < 0.50 then
-    extra = extra + ((0.50 - fieldPct) * 20000000)
+  if ni.fieldPct < 0.50 then
+    extra = extra + ((0.50 - ni.fieldPct) * 20000000)
   end
-  if satPct < 0.50 then
-    extra = extra + ((0.50 - satPct) * 8000000)
+  if ni.saturationPct < 0.50 then
+    extra = extra + ((0.50 - ni.saturationPct) * 8000000)
   end
-  if temp > CFG.targetTemp then
+  if ni.temp > CFG.targetTemp then
     extra = extra + 4000000
   end
 
-  state.desiredInput = adaptiveInput(drain * 1.35, extra)
+  state.desiredInput = adaptiveInput(ni.fieldDrain * 1.35, extra)
   state.desiredOutput = 0
   setGateFlow(inputGate, state.desiredInput)
   setGateFlow(outputGate, 0)
 
-  if fieldPct <= CFG.scramField or satPct <= CFG.scramSaturation or temp >= CFG.scramTemp then
+  if ni.fieldPct <= CFG.scramField or ni.saturationPct <= CFG.scramSaturation or ni.temp >= CFG.scramTemp then
     doScram("SCRAM during ignition hold")
     return
   end
@@ -514,12 +678,12 @@ local function ignitionHoldControl(info)
     return
   end
 
-  if fieldPct < CFG.ignitionExitField then
+  if ni.fieldPct < CFG.ignitionExitField then
     state.message = "Holding until field recovers"
     return
   end
 
-  if satPct < CFG.ignitionExitSat then
+  if ni.saturationPct < CFG.ignitionExitSat then
     state.message = "Holding until saturation stabilizes"
     return
   end
@@ -530,58 +694,53 @@ local function ignitionHoldControl(info)
 end
 
 local function runningControl(info, dt)
-  local fieldPct = getFieldPct(info)
-  local satPct = getSaturationPct(info)
-  local temp = getTemp(info)
-  local gen = getGeneration(info)
-  local drain = getFieldDrain(info)
-  local fuel = getFuel(info)
+  local ni = normalizeInfo(info)
 
-  if fieldPct <= CFG.scramField then
+  if ni.fieldPct <= CFG.scramField then
     doScram("SCRAM: field critical")
     return
   end
-  if satPct <= CFG.scramSaturation then
+  if ni.saturationPct <= CFG.scramSaturation then
     doScram("SCRAM: saturation critical")
     return
   end
-  if temp >= CFG.scramTemp then
+  if ni.temp >= CFG.scramTemp then
     doScram("SCRAM: temperature critical")
     return
   end
 
-  if CFG.enableFuelShutdown and fuel <= CFG.shutdownFuelAmount then
+  if CFG.enableFuelShutdown and ni.fuel <= CFG.shutdownFuelAmount then
     state.autoShutdown = true
     state.phase = "AUTO SHUTDOWN"
     cooldownControl(info)
     return
   end
 
-  local fieldError = CFG.targetField - fieldPct
+  local fieldError = CFG.targetField - ni.fieldPct
   local inputAdjust = pidStep(state.inputPID, CFG.inputPID, fieldError, dt)
 
   local extraInput = inputAdjust
-  if fieldPct < CFG.targetField then
-    extraInput = extraInput + ((CFG.targetField - fieldPct) * 10000000)
+  if ni.fieldPct < CFG.targetField then
+    extraInput = extraInput + ((CFG.targetField - ni.fieldPct) * 10000000)
   end
-  if temp > CFG.targetTemp then
+  if ni.temp > CFG.targetTemp then
     extraInput = extraInput + 2000000
   end
 
-  local desiredInput = adaptiveInput(drain * 1.08, extraInput)
+  local desiredInput = adaptiveInput(ni.fieldDrain * 1.08, extraInput)
 
-  local satError = satPct - CFG.targetSaturation
-  local outputBase = clamp(gen * 0.60, CFG.minOutput, CFG.maxOutput)
+  local satError = ni.saturationPct - CFG.targetSaturation
+  local outputBase = clamp(ni.generation * 0.60, CFG.minOutput, CFG.maxOutput)
   local outputAdjust = pidStep(state.outputPID, CFG.outputPID, satError, dt)
   local desiredOutput = outputBase + outputAdjust
 
-  if temp > CFG.targetTemp then
-    desiredOutput = desiredOutput - ((temp - CFG.targetTemp) * 5000)
+  if ni.temp > CFG.targetTemp then
+    desiredOutput = desiredOutput - ((ni.temp - CFG.targetTemp) * 5000)
   end
-  if fieldPct < CFG.targetField then
+  if ni.fieldPct < CFG.targetField then
     desiredOutput = desiredOutput * 0.30
   end
-  if satPct < CFG.targetSaturation then
+  if ni.saturationPct < CFG.targetSaturation then
     desiredOutput = desiredOutput * 0.60
   end
 
@@ -589,7 +748,7 @@ local function runningControl(info, dt)
 
   state.desiredInput = desiredInput
   state.desiredOutput = desiredOutput
-  state.netGain = gen - desiredInput - desiredOutput
+  state.netGain = ni.generation - desiredInput - desiredOutput
 
   setGateFlow(inputGate, desiredInput)
   setGateFlow(outputGate, desiredOutput)
@@ -606,14 +765,16 @@ local function updateControl(info)
   if dt <= 0 then dt = CFG.tickRate end
   lastTickClock = now
 
+  local ni = normalizeInfo(info)
+  state.lastNormalized = ni
+
   if state.phase == "SCRAM" then
-    local drain = getFieldDrain(info)
-    state.desiredInput = adaptiveInput(drain * 2.00, 20000000)
+    state.desiredInput = adaptiveInput(ni.fieldDrain * 2.00, 20000000)
     state.desiredOutput = 0
     setGateFlow(inputGate, state.desiredInput)
     setGateFlow(outputGate, 0)
-    state.netGain = getGeneration(info) - state.desiredInput
-    if not isOnline(info) and getTemp(info) <= CFG.cooldownSafeTemp then
+    state.netGain = ni.generation - state.desiredInput
+    if not isOnline(info) and ni.temp <= CFG.cooldownSafeTemp then
       goIdle("SCRAM complete")
     end
     return
@@ -621,13 +782,13 @@ local function updateControl(info)
 
   if state.autoShutdown then
     cooldownControl(info)
-    state.netGain = getGeneration(info) - state.desiredInput
+    state.netGain = ni.generation - state.desiredInput
     return
   end
 
   if state.phase == "IGNITION HOLD" then
     ignitionHoldControl(info)
-    state.netGain = getGeneration(info) - state.desiredInput - state.desiredOutput
+    state.netGain = ni.generation - state.desiredInput - state.desiredOutput
     return
   end
 
@@ -642,15 +803,11 @@ local function updateControl(info)
   setGateFlow(outputGate, 0)
 
   if state.chargeRequested then
-    local fieldPct = getFieldPct(info)
-    local satPct = getSaturationPct(info)
-    local temp = getTemp(info)
-
     state.desiredInput = CFG.chargeInput
     setGateFlow(inputGate, CFG.chargeInput)
     safeCall(reactor, "chargeReactor")
 
-    if fieldPct >= CFG.startupReadyField and satPct >= CFG.startupReadySat and temp >= CFG.startupReadyTemp then
+    if ni.fieldPct >= CFG.startupReadyField and ni.saturationPct >= CFG.startupReadySat and ni.temp >= CFG.startupReadyTemp then
       state.phase = "READY"
       state.message = "Ready to activate"
     else
@@ -696,41 +853,42 @@ local function drawMain(info)
   clearMonitor()
   state.buttonMap = {}
 
+  local ni = state.lastNormalized or normalizeInfo(info)
   local w, h = mon.getSize()
-  local fieldPct = getFieldPct(info)
-  local satPct = getSaturationPct(info)
-  local temp = getTemp(info)
-  local gen = getGeneration(info)
-  local drain = getFieldDrain(info)
-  local fuel = getFuel(info)
-  local status = tostring(getStatus(info))
   local online = isOnline(info)
 
   centerText(1, CFG.title, UI.accent, UI.bg)
   writeAt(1, 2, string.rep("-", w), UI.dim, UI.bg)
 
   writeAt(1, 3, "Phase: " .. state.phase, UI.accent, UI.bg)
-  writeAt(1, 4, "Raw Status: " .. status, UI.dim, UI.bg)
+  writeAt(1, 4, "Raw Status: " .. tostring(ni.status), UI.dim, UI.bg)
   writeAt(1, 5, "Derived Online: " .. tostring(online), online and UI.good or UI.warn, UI.bg)
   writeAt(1, 6, "Message: " .. tostring(state.message), UI.dim, UI.bg)
 
-  writeAt(1, 8, "Field: " .. fmtPct(fieldPct), fieldColor(fieldPct), UI.bg)
-  progressBar(1, 9, w, fieldPct, colors.blue, colors.gray)
+  writeAt(1, 8, "Field: " .. fmtPct(ni.fieldPct), fieldColor(ni.fieldPct), UI.bg)
+  progressBar(1, 9, w, ni.fieldPct, colors.blue, colors.gray)
 
-  writeAt(1, 11, "Saturation: " .. fmtPct(satPct), satColor(satPct), UI.bg)
-  progressBar(1, 12, w, satPct, colors.green, colors.gray)
+  writeAt(1, 11, "Saturation: " .. fmtPct(ni.saturationPct), satColor(ni.saturationPct), UI.bg)
+  progressBar(1, 12, w, ni.saturationPct, colors.green, colors.gray)
 
-  writeAt(1, 14, "Temp: " .. fmtInt(temp) .. " C", tempColor(temp), UI.bg)
-  writeAt(1, 15, "Generation: " .. fmtInt(gen) .. " RF/t", UI.good, UI.bg)
-  writeAt(1, 16, "Field Input/Drain: " .. fmtInt(drain) .. " RF/t", UI.warn, UI.bg)
+  writeAt(1, 14, "Temp: " .. fmtInt(ni.temp) .. " C", tempColor(ni.temp), UI.bg)
+  writeAt(1, 15, "Generation: " .. fmtInt(ni.generation) .. " RF/t", UI.good, UI.bg)
+  writeAt(1, 16, "Field Input/Drain: " .. fmtInt(ni.fieldDrain) .. " RF/t", UI.warn, UI.bg)
   writeAt(1, 17, "Input Gate: " .. fmtInt(state.desiredInput) .. " RF/t", UI.accent, UI.bg)
   writeAt(1, 18, "Output Gate: " .. fmtInt(state.desiredOutput) .. " RF/t", UI.accent, UI.bg)
   writeAt(1, 19, "Net Gain: " .. fmtInt(state.netGain) .. " RF/t", netColor(state.netGain), UI.bg)
-  writeAt(1, 20, "Fuel: " .. string.format("%.2f", fuel), UI.fg, UI.bg)
+  writeAt(1, 20, "Fuel Remaining: " .. string.format("%.2f", ni.fuel), UI.fg, UI.bg)
+  writeAt(1, 21, "Fuel %: " .. fmtPct(ni.fuelPct), UI.dim, UI.bg)
 
-  writeAt(1, 22, "Target Temp: " .. fmtInt(CFG.targetTemp) .. " C", UI.dim, UI.bg)
-  writeAt(1, 23, "Target Field: " .. fmtPct(CFG.targetField), UI.dim, UI.bg)
-  writeAt(1, 24, "Target Saturation: " .. fmtPct(CFG.targetSaturation), UI.dim, UI.bg)
+  writeAt(1, 23, "Target Temp: " .. fmtInt(CFG.targetTemp) .. " C", UI.dim, UI.bg)
+  writeAt(1, 24, "Target Field: " .. fmtPct(CFG.targetField), UI.dim, UI.bg)
+  writeAt(1, 25, "Target Saturation: " .. fmtPct(CFG.targetSaturation), UI.dim, UI.bg)
+
+  if CFG.showDebugKeys and h >= 30 then
+    writeAt(1, 27, "Field Keys: " .. ni.fieldKeys, UI.dim, UI.bg)
+    writeAt(1, 28, "Sat Keys:   " .. ni.saturationKeys, UI.dim, UI.bg)
+    writeAt(1, 29, "Fuel Key:   " .. ni.fuelKey, UI.dim, UI.bg)
+  end
 
   local by = h - 2
   local bw = math.floor(w / 4)
