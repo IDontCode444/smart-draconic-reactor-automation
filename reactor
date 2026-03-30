@@ -1,5 +1,5 @@
 --========================================================
--- Draconic Reactor Controller - adaptive input build
+-- Draconic Reactor Controller - MANUAL START VERSION
 -- Auto-detect reactor + monitor
 -- Manual naming for input/output gates only
 --========================================================
@@ -43,7 +43,7 @@ local CFG = {
 
   -- Limits
   minInput = 250000,
-  inputSanityCeiling = 2000000000, -- effectively "no limit", just overflow protection
+  inputSanityCeiling = 2000000000,
   minOutput = 0,
   maxOutput = 20000000,
 
@@ -94,6 +94,7 @@ local state = {
 
   startupActivatedAt = nil,
   autoShutdown = false,
+  chargeRequested = false,
   lastTouch = 0,
 
   buttonMap = {},
@@ -372,19 +373,41 @@ local function adaptiveInput(baseDemand, extraDemand)
   return v
 end
 
+local function goIdle(msg)
+  state.phase = "IDLE"
+  state.autoShutdown = false
+  state.chargeRequested = false
+  state.startupActivatedAt = nil
+  state.desiredInput = 0
+  state.desiredOutput = 0
+  state.netGain = 0
+  setGateFlow(inputGate, 0)
+  setGateFlow(outputGate, 0)
+  resetPID()
+  state.message = msg or "Idle"
+end
+
 local function doCharge()
   state.autoShutdown = false
+  state.chargeRequested = true
   state.startupActivatedAt = nil
   resetPID()
+  setGateFlow(inputGate, CFG.chargeInput)
+  setGateFlow(outputGate, 0)
   safeCall(reactor, "chargeReactor")
   state.phase = "CHARGING"
-  state.message = "Charge requested"
+  state.message = "Manual charge requested"
 end
 
 local function doActivate()
   local info = state.lastInfo
   if not info then
     state.message = "No reactor data"
+    return
+  end
+
+  if not state.chargeRequested then
+    state.message = "Press CHARGE first"
     return
   end
 
@@ -412,6 +435,7 @@ local function doScram(reason)
   local drain = getFieldDrain(info)
   state.phase = "SCRAM"
   state.autoShutdown = false
+  state.chargeRequested = false
   state.startupActivatedAt = nil
   state.desiredInput = adaptiveInput(drain * 2.00, 20000000)
   state.desiredOutput = 0
@@ -443,16 +467,9 @@ local function cooldownControl(info)
   safeCall(reactor, "stopReactor")
 
   if temp <= CFG.cooldownSafeTemp and not isOnline(info) then
-    state.autoShutdown = false
-    state.phase = "IDLE"
-    state.message = "Fuel shutdown complete"
-    state.desiredInput = 0
-    state.desiredOutput = 0
-    setGateFlow(inputGate, 0)
-    setGateFlow(outputGate, 0)
-    resetPID()
+    goIdle("Cooldown complete")
   else
-    state.message = "Cooling after fuel shutdown"
+    state.message = "Cooling after shutdown"
   end
 end
 
@@ -596,6 +613,9 @@ local function updateControl(info)
     setGateFlow(inputGate, state.desiredInput)
     setGateFlow(outputGate, 0)
     state.netGain = getGeneration(info) - state.desiredInput
+    if not isOnline(info) and getTemp(info) <= CFG.cooldownSafeTemp then
+      goIdle("SCRAM complete")
+    end
     return
   end
 
@@ -619,27 +639,33 @@ local function updateControl(info)
 
   state.desiredOutput = 0
   state.netGain = 0
+  setGateFlow(outputGate, 0)
 
-  local fieldPct = getFieldPct(info)
-  local satPct = getSaturationPct(info)
-  local temp = getTemp(info)
+  if state.chargeRequested then
+    local fieldPct = getFieldPct(info)
+    local satPct = getSaturationPct(info)
+    local temp = getTemp(info)
 
-  if fieldPct >= CFG.startupReadyField and satPct >= CFG.startupReadySat and temp >= CFG.startupReadyTemp then
-    state.phase = "READY"
     state.desiredInput = CFG.chargeInput
     setGateFlow(inputGate, CFG.chargeInput)
-    setGateFlow(outputGate, 0)
-    state.message = "Ready to activate"
+    safeCall(reactor, "chargeReactor")
+
+    if fieldPct >= CFG.startupReadyField and satPct >= CFG.startupReadySat and temp >= CFG.startupReadyTemp then
+      state.phase = "READY"
+      state.message = "Ready to activate"
+    else
+      state.phase = "CHARGING"
+      state.message = "Charging reactor"
+    end
     return
   end
 
-  state.phase = "CHARGING"
-  state.desiredInput = CFG.chargeInput
+  state.phase = "IDLE"
+  state.desiredInput = 0
   state.desiredOutput = 0
-  setGateFlow(inputGate, CFG.chargeInput)
+  setGateFlow(inputGate, 0)
   setGateFlow(outputGate, 0)
-  safeCall(reactor, "chargeReactor")
-  state.message = "Charging reactor"
+  state.message = "Idle - press CHARGE to begin"
 end
 
 local function fieldColor(v)
