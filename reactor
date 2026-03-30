@@ -1,5 +1,5 @@
 --========================================================
--- Draconic Reactor Controller - MANUAL START + FIXED READOUT
+-- Draconic Reactor Controller - MANUAL START + ATM10 READ FIX
 -- Auto-detect reactor + monitor
 -- Manual naming for input/output gates only
 --========================================================
@@ -66,7 +66,6 @@ local CFG = {
   },
 
   buttonDebounce = 0.20,
-
   showDebugKeys = true,
 }
 
@@ -113,7 +112,9 @@ local function clamp(v, lo, hi)
   return v
 end
 
-local function round(n) return math.floor((tonumber(n) or 0) + 0.5) end
+local function round(n)
+  return math.floor((tonumber(n) or 0) + 0.5)
+end
 
 local function toNum(v)
   local n = tonumber(v)
@@ -265,6 +266,20 @@ local function normalizeStatus(s)
   return t, s
 end
 
+local function lower(s)
+  return string.lower(tostring(s or ""))
+end
+
+local function containsAny(s, tokens)
+  s = lower(s)
+  for _, tok in ipairs(tokens) do
+    if s:find(tok, 1, true) then
+      return true
+    end
+  end
+  return false
+end
+
 local function getAny(info, names)
   for _, k in ipairs(names) do
     local v = info[k]
@@ -276,35 +291,226 @@ local function getAny(info, names)
   return nil, nil
 end
 
-local function choosePair(info, pairs)
+local function collectNumericPairs(info)
+  local nums = {}
+  for k, v in pairs(info) do
+    if type(k) == "string" then
+      local n = toNum(v)
+      if n ~= nil then
+        nums[k] = n
+      end
+    end
+  end
+  return nums
+end
+
+local function chooseBestPair(candidates)
   local best = nil
-
-  for _, pair in ipairs(pairs) do
-    local cur = toNum(info[pair[1]])
-    local max = toNum(info[pair[2]])
-
-    if cur and max and max > 0 then
-      local pct = cur / max
+  for _, c in ipairs(candidates) do
+    if c.max and c.max > 0 then
+      local pct = c.value / c.max
       local score = 0
 
       if pct >= 0 and pct <= 1.05 then score = score + 100 end
-      if cur > 0 then score = score + 10 end
-      if max > 1 then score = score + 5 end
+      if c.value > 0 then score = score + 30 end
+      if c.value > 1 then score = score + 10 end
+      if c.max > 1 then score = score + 5 end
+      if pct > 0.01 and pct < 0.99 then score = score + 20 end
+      if c.preferred then score = score + 25 end
 
-      if not best or score > best.score then
-        best = {
-          value = cur,
-          max = max,
-          pct = clamp(pct, 0, 1),
-          valueKey = pair[1],
-          maxKey = pair[2],
-          score = score,
-        }
+      c.score = score
+      c.pct = clamp(pct, 0, 1)
+
+      if not best or c.score > best.score then
+        best = c
+      end
+    end
+  end
+  return best
+end
+
+local function discoverPairByTokens(info, valueTokens, maxTokens, preferredKnown)
+  local nums = collectNumericPairs(info)
+  local candidates = {}
+
+  for valueKey, value in pairs(nums) do
+    local lvk = lower(valueKey)
+    if containsAny(lvk, valueTokens) and not lvk:find("max", 1, true) then
+      for maxKey, maxValue in pairs(nums) do
+        local lmk = lower(maxKey)
+        if containsAny(lmk, maxTokens) and lmk:find("max", 1, true) then
+          local scoreBoost = 0
+          local joined = valueKey .. "/" .. maxKey
+
+          for _, pair in ipairs(preferredKnown or {}) do
+            if pair[1] == valueKey and pair[2] == maxKey then
+              scoreBoost = 25
+              break
+            end
+          end
+
+          if maxValue > 0 and value >= 0 then
+            local shared = 0
+            for _, tok in ipairs(valueTokens) do
+              if lvk:find(tok, 1, true) and lmk:find(tok, 1, true) then
+                shared = shared + 1
+              end
+            end
+
+            table.insert(candidates, {
+              value = value,
+              max = maxValue,
+              valueKey = valueKey,
+              maxKey = maxKey,
+              preferred = shared > 0 or scoreBoost > 0,
+              pairName = joined,
+            })
+          end
+        end
       end
     end
   end
 
+  local best = chooseBestPair(candidates)
+  return best, candidates
+end
+
+local function chooseKnownPair(info, pairs)
+  local candidates = {}
+  for _, pair in ipairs(pairs) do
+    local v = toNum(info[pair[1]])
+    local m = toNum(info[pair[2]])
+    if v ~= nil and m ~= nil and m > 0 then
+      table.insert(candidates, {
+        value = v,
+        max = m,
+        valueKey = pair[1],
+        maxKey = pair[2],
+        preferred = true,
+        pairName = pair[1] .. "/" .. pair[2],
+      })
+    end
+  end
+  return chooseBestPair(candidates)
+end
+
+local function chooseFieldPair(info, statusNorm)
+  local known = {
+    {"fieldStrength", "maxFieldStrength"},
+    {"shieldCharge", "maxShieldCharge"},
+    {"fieldCharge", "maxFieldCharge"},
+    {"shieldStrength", "maxShieldStrength"},
+    {"containmentField", "maxContainmentField"},
+    {"containment", "maxContainment"},
+  }
+
+  local knownBest = chooseKnownPair(info, known)
+  local discoveredBest = discoverPairByTokens(
+    info,
+    {"field", "shield", "containment"},
+    {"field", "shield", "containment"},
+    known
+  )
+
+  local best = knownBest
+  if discoveredBest and (not best or discoveredBest.score > best.score) then
+    best = discoveredBest
+  end
+
+  -- ATM10 startup workaround:
+  -- If the chosen pair is stuck at 0 during charging/warming, but another field-like pair is nonzero,
+  -- prefer the nonzero one.
+  if best and best.pct <= 0.001 and (statusNorm == "charging" or statusNorm == "warming_up" or statusNorm == "warmingup" or statusNorm == "cold") then
+    local nums = collectNumericPairs(info)
+    local fallbackCandidates = {}
+
+    for k, v in pairs(nums) do
+      local lk = lower(k)
+      if containsAny(lk, {"field", "shield", "containment"}) and not lk:find("max", 1, true) and v > 0 then
+        for mk, mv in pairs(nums) do
+          local lmk = lower(mk)
+          if containsAny(lmk, {"field", "shield", "containment"}) and lmk:find("max", 1, true) and mv > 0 then
+            local pct = v / mv
+            if pct > 0.01 and pct < 1.0 then
+              table.insert(fallbackCandidates, {
+                value = v,
+                max = mv,
+                valueKey = k,
+                maxKey = mk,
+                preferred = true,
+                pairName = k .. "/" .. mk,
+              })
+            end
+          end
+        end
+      end
+    end
+
+    local fallback = chooseBestPair(fallbackCandidates)
+    if fallback and fallback.pct > 0.01 then
+      best = fallback
+    end
+  end
+
   return best
+end
+
+local function chooseSatPair(info)
+  local known = {
+    {"energySaturation", "maxEnergySaturation"},
+    {"saturation", "maxSaturation"},
+    {"coreSaturation", "maxCoreSaturation"},
+    {"energy", "maxEnergy"},
+  }
+
+  local knownBest = chooseKnownPair(info, known)
+  local discoveredBest = discoverPairByTokens(
+    info,
+    {"saturation", "energy"},
+    {"saturation", "energy"},
+    known
+  )
+
+  if discoveredBest and (not knownBest or discoveredBest.score > knownBest.score) then
+    return discoveredBest
+  end
+  return knownBest
+end
+
+local function chooseFuel(info)
+  local fuelConv = toNum(info.fuelConversion)
+  local maxFuelConv = toNum(info.maxFuelConversion)
+  local reactableFuel = toNum(info.reactableFuel)
+  local fuel = toNum(info.fuel)
+  local convertedFuel = toNum(info.convertedFuel)
+
+  if fuelConv and maxFuelConv and maxFuelConv > 0 then
+    local remaining = math.max(0, maxFuelConv - fuelConv)
+    return remaining, maxFuelConv, "maxFuelConversion-fuelConversion"
+  end
+
+  if reactableFuel and reactableFuel >= 0 then
+    return reactableFuel, math.max(reactableFuel, 1), "reactableFuel"
+  end
+
+  if fuel and fuel >= 0 then
+    return fuel, math.max(fuel, 1), "fuel"
+  end
+
+  if convertedFuel and convertedFuel >= 0 then
+    return convertedFuel, math.max(convertedFuel, 1), "convertedFuel"
+  end
+
+  for k, v in pairs(info) do
+    if type(k) == "string" then
+      local n = toNum(v)
+      if n and lower(k):find("fuel", 1, true) then
+        return n, math.max(n, 1), k
+      end
+    end
+  end
+
+  return 0, 1, "fallback0"
 end
 
 local function normalizeInfo(info)
@@ -326,69 +532,10 @@ local function normalizeInfo(info)
   })
   drain = drain or 0
 
-  local field = choosePair(info, {
-    {"fieldStrength", "maxFieldStrength"},
-    {"shieldCharge", "maxShieldCharge"},
-    {"fieldCharge", "maxFieldCharge"},
-    {"shieldStrength", "maxShieldStrength"},
-    {"shield", "maxShield"},
-  })
+  local field = chooseFieldPair(info, statusNorm)
+  local sat = chooseSatPair(info)
 
-  local sat = choosePair(info, {
-    {"energySaturation", "maxEnergySaturation"},
-    {"saturation", "maxSaturation"},
-    {"coreSaturation", "maxCoreSaturation"},
-    {"energy", "maxEnergy"},
-  })
-
-  if not field then
-    local v, vk = getAny(info, {"fieldStrength", "shieldCharge", "fieldCharge", "shieldStrength", "shield"})
-    local m, mk = getAny(info, {"maxFieldStrength", "maxShieldCharge", "maxFieldCharge", "maxShieldStrength", "maxShield"})
-    if v and m and m > 0 then
-      field = { value = v, max = m, pct = clamp(v / m, 0, 1), valueKey = vk, maxKey = mk }
-    end
-  end
-
-  if not sat then
-    local v, vk = getAny(info, {"energySaturation", "saturation", "coreSaturation", "energy"})
-    local m, mk = getAny(info, {"maxEnergySaturation", "maxSaturation", "maxCoreSaturation", "maxEnergy"})
-    if v and m and m > 0 then
-      sat = { value = v, max = m, pct = clamp(v / m, 0, 1), valueKey = vk, maxKey = mk }
-    end
-  end
-
-  local fuelRemaining = nil
-  local fuelMax = nil
-  local fuelDisplayKey = "unknown"
-
-  local fuelConv = toNum(info.fuelConversion)
-  local maxFuelConv = toNum(info.maxFuelConversion)
-  local reactableFuel = toNum(info.reactableFuel)
-  local fuel = toNum(info.fuel)
-  local convertedFuel = toNum(info.convertedFuel)
-
-  if fuelConv and maxFuelConv and maxFuelConv > 0 then
-    fuelRemaining = math.max(0, maxFuelConv - fuelConv)
-    fuelMax = maxFuelConv
-    fuelDisplayKey = "maxFuelConversion-fuelConversion"
-  elseif reactableFuel and reactableFuel >= 0 then
-    fuelRemaining = reactableFuel
-    fuelMax = reactableFuel
-    fuelDisplayKey = "reactableFuel"
-  elseif fuel and fuel >= 0 then
-    fuelRemaining = fuel
-    fuelMax = fuel
-    fuelDisplayKey = "fuel"
-  elseif convertedFuel and convertedFuel >= 0 then
-    fuelRemaining = convertedFuel
-    fuelMax = convertedFuel
-    fuelDisplayKey = "convertedFuel"
-  else
-    fuelRemaining = 0
-    fuelMax = 1
-    fuelDisplayKey = "fallback0"
-  end
-
+  local fuelRemaining, fuelMax, fuelKey = chooseFuel(info)
   local fuelPct = 0
   if fuelMax and fuelMax > 0 then
     fuelPct = clamp(fuelRemaining / fuelMax, 0, 1)
@@ -420,54 +567,10 @@ local function normalizeInfo(info)
     fuel = fuelRemaining,
     fuelMax = fuelMax or 1,
     fuelPct = fuelPct,
-    fuelKey = fuelDisplayKey,
+    fuelKey = fuelKey,
 
     raw = info,
   }
-end
-
-local function getStatus(info)
-  return normalizeInfo(info).status
-end
-
-local function getField(info)
-  return normalizeInfo(info).field
-end
-
-local function getMaxField(info)
-  return normalizeInfo(info).maxField
-end
-
-local function getFieldPct(info)
-  return normalizeInfo(info).fieldPct
-end
-
-local function getSaturation(info)
-  return normalizeInfo(info).saturation
-end
-
-local function getMaxSaturation(info)
-  return normalizeInfo(info).maxSaturation
-end
-
-local function getSaturationPct(info)
-  return normalizeInfo(info).saturationPct
-end
-
-local function getTemp(info)
-  return normalizeInfo(info).temp
-end
-
-local function getGeneration(info)
-  return normalizeInfo(info).generation
-end
-
-local function getFieldDrain(info)
-  return normalizeInfo(info).fieldDrain
-end
-
-local function getFuel(info)
-  return normalizeInfo(info).fuel
 end
 
 local function statusLooksOnline(status)
