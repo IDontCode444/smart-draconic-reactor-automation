@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "4.0",
+  version      = "5.0",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -38,20 +38,32 @@ local CONFIG = {
   chargeReadySaturation = 50,
 
   ----------------------------------------------------------
-  -- ACTIVATE / STARTUP FIX
+  -- ACTIVATE / STARTUP
   ----------------------------------------------------------
-  activatePrimeInputFloor   = 64000000, -- set BEFORE activate
-  activatePrimeMultiplier   = 1.75,
-  activatePrimeSeconds      = 0.60,     -- hold pre-activation
-  startupInputFloor         = 64000000, -- hold AFTER activate
-  startupInputMultiplier    = 1.50,
-  startupHoldSeconds        = 20,
-  startupExitTemp           = 5000,
-  startupExitField          = 42,
-  startupExitSaturation     = 72,
-  startupRecoverField       = 48,
-  startupRecoverSat         = 80,
-  startupOutputCap          = 0,        -- no output during startup
+  activatePrimeInputFloor = 64000000,
+  activatePrimeMultiplier = 1.75,
+  activatePrimeSeconds    = 0.60,
+
+  startupInputFloor       = 64000000,
+  startupInputMultiplier  = 1.45,
+  startupHoldSeconds      = 4.0,
+
+  -- After the short hold, deliberately bleed energy out so the
+  -- reactor can leave 100% saturation and actually start heating.
+  bleedOutputStart        = 250000,
+  bleedOutputRampUp       = 250000,
+  bleedOutputMax          = 12000000,
+  bleedMinSeconds         = 2.0,
+
+  -- Exit startup when the reactor is actually alive, not when it hits
+  -- an impossible combination while output is clamped.
+  startupExitGeneration   = 50000,
+  startupExitField        = 45,
+  startupExitSaturationHi = 95,
+  startupExitSaturationLo = 55,
+
+  startupRecoverField     = 50,
+  startupRecoverSat       = 85,
 
   ----------------------------------------------------------
   -- CHARGING / COOLING
@@ -84,8 +96,8 @@ local CONFIG = {
   maxInput             = 2147483000,
   maxOutput            = 2147483000,
   inputBaseFloorFactor = 1.12,
-  outputRampUp         = 60000,
-  outputRampDown       = 250000,
+  outputRampUp         = 150000,
+  outputRampDown       = 350000,
 
   ----------------------------------------------------------
   -- PID TUNING
@@ -122,12 +134,13 @@ local state = {
   safeStopLatch = false,
   scramReason = nil,
 
-  mode = "idle", -- idle, charging, ready, priming, startup, run, stopping, cooling, scram
+  mode = "idle", -- idle, charging, ready, priming, startup_hold, startup_bleed, run, stopping, cooling, scram
   readyToActivate = false,
   activateRequested = false,
   chargeRequested = false,
 
   startupSince = nil,
+  bleedSince = nil,
   primeUntil = nil,
 
   lastInput = 0,
@@ -681,6 +694,7 @@ local function scram(reason)
   state.activateRequested = false
   state.chargeRequested = false
   state.startupSince = nil
+  state.bleedSince = nil
   state.primeUntil = nil
 
   pcall(function() reactor.stopReactor() end)
@@ -696,6 +710,7 @@ local function safeShutdown(reason)
   state.readyToActivate = false
   state.activateRequested = false
   state.startupSince = nil
+  state.bleedSince = nil
   state.primeUntil = nil
 
   pcall(function() reactor.stopReactor() end)
@@ -713,6 +728,7 @@ local function processOperatorRequests(info)
     state.activateRequested = false
     state.readyToActivate = false
     state.startupSince = nil
+    state.bleedSince = nil
     state.primeUntil = nil
     state.mode = "charging"
     resetPIDs()
@@ -738,7 +754,6 @@ local function processOperatorRequests(info)
       return
     end
 
-    -- Prime injector BEFORE activate. This is the main fix.
     gateSet(gateOut, 0)
     holdInputSafe(info, 55, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
     state.lastOutput = 0
@@ -851,27 +866,25 @@ local function applyPrimingControl(info)
     pcall(function() reactor.activateReactor() end)
     state.primeUntil = nil
     state.startupSince = os.clock()
-    state.mode = "startup"
-    setStatus("Activated - startup hold engaged", colors.lime)
+    state.bleedSince = nil
+    state.mode = "startup_hold"
+    setStatus("Activated - startup hold", colors.lime)
   else
     setStatus("Priming injector before activation", colors.yellow)
   end
 end
 
-local function applyStartupControl(info)
+local function applyStartupHoldControl(info)
   local fp = fieldPct(info)
   local sp = saturationPct(info)
   local temp = info.temperature or 0
   local elapsed = os.clock() - (state.startupSince or os.clock())
 
-  gateSet(gateOut, CONFIG.startupOutputCap)
-  state.lastOutput = CONFIG.startupOutputCap
+  gateSet(gateOut, 0)
+  state.lastOutput = 0
 
   local startupBase = computeBaseInput(info, 55)
-  local wantIn = math.max(
-    startupBase * CONFIG.startupInputMultiplier,
-    CONFIG.startupInputFloor
-  )
+  local wantIn = math.max(startupBase * CONFIG.startupInputMultiplier, CONFIG.startupInputFloor)
 
   if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
     wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.15)
@@ -881,26 +894,77 @@ local function applyStartupControl(info)
   gateSet(gateIn, wantIn)
   state.lastInput = wantIn
 
-  local startupDone =
-    elapsed >= CONFIG.startupHoldSeconds
-    and temp >= CONFIG.startupExitTemp
+  if elapsed >= CONFIG.startupHoldSeconds then
+    state.mode = "startup_bleed"
+    state.bleedSince = os.clock()
+    state.lastOutput = CONFIG.bleedOutputStart
+    gateSet(gateOut, CONFIG.bleedOutputStart)
+    setStatus("Startup bleed phase", colors.yellow)
+    return
+  end
+
+  state.mode = "startup_hold"
+  setStatus(
+    ("Startup hold %.1fs  T:%d  F:%.1f%%  S:%.1f%%  In:%s"):format(
+      elapsed, temp, fp, sp, fmtInt(wantIn)
+    ),
+    colors.yellow
+  )
+end
+
+local function applyStartupBleedControl(info)
+  local fp = fieldPct(info)
+  local sp = saturationPct(info)
+  local temp = info.temperature or 0
+  local gen = info.generationRate or 0
+  local elapsed = os.clock() - (state.bleedSince or os.clock())
+
+  local startupBase = computeBaseInput(info, 55)
+  local wantIn = math.max(startupBase * CONFIG.startupInputMultiplier, CONFIG.startupInputFloor)
+
+  if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
+    wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.10)
+  end
+
+  wantIn = clamp(wantIn, 0, CONFIG.maxInput)
+  gateSet(gateIn, wantIn)
+  state.lastInput = wantIn
+
+  local bleedTarget = clamp(
+    state.lastOutput + CONFIG.bleedOutputRampUp,
+    CONFIG.bleedOutputStart,
+    CONFIG.bleedOutputMax
+  )
+
+  if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
+    bleedTarget = math.max(0, state.lastOutput - CONFIG.bleedOutputRampUp * 2)
+  end
+
+  gateSet(gateOut, bleedTarget)
+  state.lastOutput = bleedTarget
+
+  local readyForRun =
+    elapsed >= CONFIG.bleedMinSeconds
+    and gen >= CONFIG.startupExitGeneration
     and fp >= CONFIG.startupExitField
-    and sp >= CONFIG.startupExitSaturation
+    and sp <= CONFIG.startupExitSaturationHi
+    and sp >= CONFIG.startupExitSaturationLo
     and isRunningStatus(info.status)
 
-  if startupDone then
+  if readyForRun then
     state.mode = "run"
     resetPIDs()
     setStatus("Startup complete - run mode", colors.lime)
-  else
-    state.mode = "startup"
-    setStatus(
-      ("Startup %.1fs  T:%d  F:%.1f%%  S:%.1f%%  In:%s"):format(
-        elapsed, temp, fp, sp, fmtInt(wantIn)
-      ),
-      colors.yellow
-    )
+    return
   end
+
+  state.mode = "startup_bleed"
+  setStatus(
+    ("Startup bleed %.1fs  T:%d  G:%s  F:%.1f%%  S:%.1f%%  Out:%s"):format(
+      elapsed, temp, fmtInt(gen), fp, sp, fmtInt(bleedTarget)
+    ),
+    colors.yellow
+  )
 end
 
 local function applyRunControl(info, dt)
@@ -986,6 +1050,7 @@ local function applyControl(info, dt)
     state.lastOutput = 0
     state.readyToActivate = false
     state.startupSince = nil
+    state.bleedSince = nil
     state.primeUntil = nil
     state.mode = "idle"
 
@@ -1010,8 +1075,18 @@ local function applyControl(info, dt)
   end
 
   if isRunningStatus(status) then
-    if state.mode == "startup" or state.startupSince ~= nil then
-      applyStartupControl(info)
+    if state.mode == "startup_hold" then
+      applyStartupHoldControl(info)
+      return
+    end
+
+    if state.mode == "startup_bleed" then
+      applyStartupBleedControl(info)
+      return
+    end
+
+    if state.startupSince ~= nil and state.mode ~= "run" then
+      applyStartupHoldControl(info)
       return
     end
 
