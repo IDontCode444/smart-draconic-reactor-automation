@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "5.0",
+  version      = "6.0",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -29,6 +29,7 @@ local CONFIG = {
   targetTemp        = 7600,
   targetField       = 45,
   targetSaturation  = 58,
+  targetGain        = 100,   -- 100 = normal, higher = more aggressive output chase
 
   ----------------------------------------------------------
   -- READY THRESHOLDS
@@ -44,26 +45,23 @@ local CONFIG = {
   activatePrimeMultiplier = 1.75,
   activatePrimeSeconds    = 0.60,
 
-  startupInputFloor       = 64000000,
-  startupInputMultiplier  = 1.45,
+  startupHoldInputFloor   = 64000000,
+  startupHoldMultiplier   = 1.45,
   startupHoldSeconds      = 4.0,
 
-  -- After the short hold, deliberately bleed energy out so the
-  -- reactor can leave 100% saturation and actually start heating.
+  -- Startup bleed: deliberately back injector down and open output
+  bleedInputFloor         = 8000000,
+  bleedInputMultiplier    = 1.30,
   bleedOutputStart        = 250000,
-  bleedOutputRampUp       = 250000,
-  bleedOutputMax          = 12000000,
+  bleedOutputRampUp       = 500000,
+  bleedOutputMax          = 30000000,
   bleedMinSeconds         = 2.0,
+  bleedTimeoutSeconds     = 35.0,
 
-  -- Exit startup when the reactor is actually alive, not when it hits
-  -- an impossible combination while output is clamped.
-  startupExitGeneration   = 50000,
-  startupExitField        = 45,
-  startupExitSaturationHi = 95,
-  startupExitSaturationLo = 55,
-
+  startupExitGeneration   = 1000000,
+  startupExitField        = 42,
   startupRecoverField     = 50,
-  startupRecoverSat       = 85,
+  startupRecoverSat       = 82,
 
   ----------------------------------------------------------
   -- CHARGING / COOLING
@@ -96,8 +94,8 @@ local CONFIG = {
   maxInput             = 2147483000,
   maxOutput            = 2147483000,
   inputBaseFloorFactor = 1.12,
-  outputRampUp         = 150000,
-  outputRampDown       = 350000,
+  outputRampUp         = 200000,
+  outputRampDown       = 500000,
 
   ----------------------------------------------------------
   -- PID TUNING
@@ -106,8 +104,8 @@ local CONFIG = {
     inputField = { kp = 9000,  ki = 500,  kd = 1800, min = -3000000, max = 5000000 },
     inputTemp  = { kp = 150,   ki = 12,   kd = 300,  min = -1500000, max = 1500000 },
 
-    outputSat  = { kp = 22000, ki = 1000, kd = 4000, min = -2500000, max = 2500000 },
-    outputTemp = { kp = 2500,  ki = 120,  kd = 700,  min = -1200000, max = 1200000 },
+    outputSat  = { kp = 22000, ki = 1000, kd = 4000, min = -3000000, max = 3000000 },
+    outputTemp = { kp = 2500,  ki = 120,  kd = 700,  min = -1500000, max = 1500000 },
   }
 }
 
@@ -119,9 +117,8 @@ local reactor, gateIn, gateOut, monitor
 local monName
 local monW, monH = 0, 0
 local buttons = {}
-local screenCache = {}
-local uiPage = "main"
 local running = true
+local uiPage = "main"
 local lastInfo = nil
 
 local state = {
@@ -201,6 +198,10 @@ local function slew(current, target, upRate, downRate)
     return math.max(current - downRate, target)
   end
   return current
+end
+
+local function gainScale()
+  return clamp((CONFIG.targetGain or 100) / 100, 0.25, 3.0)
 end
 
 --========================================================--
@@ -435,39 +436,25 @@ local function holdInputSafe(info, targetFieldValue, floorValue, multiplier)
 end
 
 --========================================================--
--- LOW-FLICKER UI
+-- UI
 --========================================================--
 
 local function clearButtons()
   buttons = {}
 end
 
-local function cacheKey(x, y)
-  return tostring(x) .. ":" .. tostring(y)
-end
-
-local function drawText(x, y, txt, fg, bg)
-  local key = cacheKey(x, y)
-  local sig = table.concat({txt or "", fg or 0, bg or 0}, "|")
-  if screenCache[key] == sig then return end
-  screenCache[key] = sig
-
+local function writeAt(x, y, text, fg, bg)
   if bg then monitor.setBackgroundColor(bg) end
   if fg then monitor.setTextColor(fg) end
   monitor.setCursorPos(x, y)
-  monitor.write(txt)
+  monitor.write(text)
 end
 
 local function fillRect(x1, y1, x2, y2, bg)
   monitor.setBackgroundColor(bg)
   for y = y1, y2 do
-    local key = cacheKey(x1, y) .. ":fill:" .. tostring(x2)
-    local sig = tostring(bg)
-    if screenCache[key] ~= sig then
-      screenCache[key] = sig
-      monitor.setCursorPos(x1, y)
-      monitor.write((" "):rep(x2 - x1 + 1))
-    end
+    monitor.setCursorPos(x1, y)
+    monitor.write((" "):rep(x2 - x1 + 1))
   end
 end
 
@@ -482,35 +469,74 @@ local function drawButton(b)
   fillRect(b.x1, b.y1, b.x2, b.y2, b.bg)
   local tx = math.floor((b.x1 + b.x2 - #b.label) / 2)
   local ty = math.floor((b.y1 + b.y2) / 2)
-  drawText(tx, ty, b.label, b.fg, b.bg)
+  writeAt(tx, ty, b.label, b.fg, b.bg)
 end
 
 local function drawBar(x, y, w, valuePct, fillColor, backColor, label)
   valuePct = clamp(valuePct or 0, 0, 100)
   local fillW = math.floor((w * valuePct) / 100)
 
-  for i = 0, w - 1 do
-    local bg = (i < fillW) and fillColor or backColor
-    drawText(x + i, y, " ", colors.white, bg)
+  monitor.setBackgroundColor(backColor)
+  monitor.setCursorPos(x, y)
+  monitor.write((" "):rep(w))
+
+  if fillW > 0 then
+    monitor.setBackgroundColor(fillColor)
+    monitor.setCursorPos(x, y)
+    monitor.write((" "):rep(fillW))
   end
 
   local txt = label .. " " .. string.format("%5.1f%%", valuePct)
   local tx = x + math.max(0, math.floor((w - #txt) / 2))
-  drawText(tx, y, txt, colors.white, colors.black)
+  writeAt(tx, y, txt, colors.white, colors.black)
 end
 
-local function clearScreenCache()
-  screenCache = {}
-end
-
-local function drawStaticMain()
-  clearScreenCache()
+local function drawMain(info)
+  clearButtons()
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
-  clearButtons()
 
-  drawText(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
-  drawText(math.max(2, monW - 14), 1, "MAIN", colors.lightGray, colors.black)
+  local fp = info and fieldPct(info) or 0
+  local sp = info and saturationPct(info) or 0
+  local fup = info and fuelPct(info) or 0
+  local tpct = info and pct(info.temperature or 0, CONFIG.tempEmergency) or 0
+
+  writeAt(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
+  writeAt(math.max(2, monW - 8), 1, "MAIN", colors.lightGray, colors.black)
+
+  writeAt(2, 3, "Status: ", colors.white, colors.black)
+  writeAt(10, 3, info and statusLabel(info.status) or "NO DATA",
+    info and reactorStatusColor(info.status) or colors.red, colors.black)
+
+  writeAt(2, 4, "Mode: ", colors.white, colors.black)
+  writeAt(8, 4, string.upper(state.mode), colors.yellow, colors.black)
+
+  writeAt(2, 6, "Reactor: " .. CONFIG.reactorName, colors.lightGray, colors.black)
+  writeAt(2, 7, "Input:   " .. CONFIG.inputGateName, colors.lightGray, colors.black)
+  writeAt(2, 8, "Output:  " .. CONFIG.outputGateName, colors.lightGray, colors.black)
+
+  if info then
+    writeAt(2, 10, "Temp:       " .. fmtInt(info.temperature or 0) .. " C", colors.white, colors.black)
+    writeAt(2, 11, "Generate:   " .. fmtInt(info.generationRate or 0) .. " RF/t", colors.white, colors.black)
+    writeAt(2, 12, "Drain:      " .. fmtInt(info.fieldDrainRate or 0) .. " RF/t", colors.white, colors.black)
+    writeAt(2, 13, "Fuel Rate:  " .. fmtInt(info.fuelConversionRate or 0) .. " nb/t", colors.white, colors.black)
+    writeAt(2, 14, "Input Set:  " .. fmtInt(gateGet(gateIn)) .. " RF/t", colors.lightBlue, colors.black)
+    writeAt(2, 15, "Output Set: " .. fmtInt(gateGet(gateOut)) .. " RF/t", colors.lightBlue, colors.black)
+  end
+
+  drawBar(2, 17, monW - 4, tpct, colors.red, colors.gray, "TEMP LIMIT")
+  drawBar(2, 19, monW - 4, fp, colors.blue, colors.gray, "FIELD")
+  drawBar(2, 21, monW - 4, sp, colors.green, colors.gray, "SATURATION")
+  drawBar(2, 23, monW - 4, fup, colors.orange, colors.gray, "FUEL")
+
+  writeAt(2, 25,
+    ("Targets T:%dC  F:%s  S:%s  G:%d%%"):format(
+      CONFIG.targetTemp, fmtPct(CONFIG.targetField), fmtPct(CONFIG.targetSaturation), CONFIG.targetGain
+    ),
+    colors.yellow, colors.black
+  )
+
+  writeAt(2, 26, "Status: " .. state.statusMsg, state.statusColor, colors.black)
 
   addButton("charge", 2, 28, 13, 30, "Charge", colors.yellow, colors.black, function()
     state.chargeRequested = true
@@ -527,16 +553,20 @@ local function drawStaticMain()
     state.scramReason = "Operator SCRAM"
   end)
 
-  addButton("auto", 43, 28, 55, 30, "Auto ON", colors.green, colors.black, function()
-    state.autoEnabled = not state.autoEnabled
-    resetPIDs()
-    setStatus(state.autoEnabled and "Auto enabled" or "Auto paused",
-      state.autoEnabled and colors.lime or colors.orange)
-  end)
+  addButton("auto", 43, 28, 55, 30,
+    state.autoEnabled and "Auto ON" or "Auto OFF",
+    state.autoEnabled and colors.green or colors.orange,
+    colors.black,
+    function()
+      state.autoEnabled = not state.autoEnabled
+      resetPIDs()
+      setStatus(state.autoEnabled and "Auto enabled" or "Auto paused",
+        state.autoEnabled and colors.lime or colors.orange)
+    end
+  )
 
   addButton("tune", 57, 28, math.max(68, monW - 2), 30, "Tune", colors.cyan, colors.black, function()
     uiPage = "tune"
-    drawStaticTune()
   end)
 
   for _, b in pairs(buttons) do
@@ -544,40 +574,66 @@ local function drawStaticMain()
   end
 end
 
-function drawStaticTune()
-  clearScreenCache()
+local function tuneAdjust(key, delta, minVal, maxVal)
+  CONFIG[key] = clamp((CONFIG[key] or 0) + delta, minVal, maxVal)
+end
+
+local function addTuneRow(y, label, value, buttonsDef)
+  writeAt(3, y, label, colors.white, colors.black)
+  writeAt(24, y, value, colors.yellow, colors.black)
+
+  local x = 34
+  for _, def in ipairs(buttonsDef) do
+    addButton(def.id, x, y - 1, x + 5, y, def.label, def.bg, def.fg, def.fn)
+    x = x + 7
+  end
+end
+
+local function drawTune()
+  clearButtons()
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
-  clearButtons()
 
-  drawText(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
-  drawText(math.max(2, monW - 14), 1, "TUNE", colors.lightGray, colors.black)
+  writeAt(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
+  writeAt(math.max(2, monW - 8), 1, "TUNE", colors.lightGray, colors.black)
 
-  drawText(2, 4, "Live targets (not saved to disk)", colors.white, colors.black)
-  drawText(2, 5, "Charge and Activate are separate.", colors.lightGray, colors.black)
+  writeAt(3, 3, "Live tuning page", colors.white, colors.black)
+  writeAt(3, 4, "Targets update immediately while running.", colors.lightGray, colors.black)
+  writeAt(3, 5, "Gain = output aggressiveness.", colors.lightGray, colors.black)
 
-  local function addTuneRow(y, key, minVal, maxVal, stepSmall, stepLarge)
-    addButton(key .. "_mL", 30, y, 35, y+1, "-"..stepLarge, colors.red, colors.white, function()
-      CONFIG[key] = clamp(CONFIG[key] - stepLarge, minVal, maxVal)
-    end)
-    addButton(key .. "_mS", 37, y, 41, y+1, "-"..stepSmall, colors.orange, colors.black, function()
-      CONFIG[key] = clamp(CONFIG[key] - stepSmall, minVal, maxVal)
-    end)
-    addButton(key .. "_pS", 43, y, 47, y+1, "+"..stepSmall, colors.lime, colors.black, function()
-      CONFIG[key] = clamp(CONFIG[key] + stepSmall, minVal, maxVal)
-    end)
-    addButton(key .. "_pL", 49, y, 54, y+1, "+"..stepLarge, colors.green, colors.black, function()
-      CONFIG[key] = clamp(CONFIG[key] + stepLarge, minVal, maxVal)
-    end)
-  end
+  addTuneRow(8, "Target Temp", tostring(CONFIG.targetTemp), {
+    { id="tt_m10", label="-10", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetTemp", -10, 7000, 7900) end },
+    { id="tt_m1",  label="-1",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetTemp", -1, 7000, 7900) end },
+    { id="tt_p1",  label="+1",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetTemp", 1, 7000, 7900) end },
+    { id="tt_p10", label="+10", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetTemp", 10, 7000, 7900) end },
+  })
 
-  addTuneRow(8,  "targetTemp",       7000, 7900, 1, 10)
-  addTuneRow(12, "targetField",      35,   65,   1, 5)
-  addTuneRow(16, "targetSaturation", 45,   85,   1, 5)
+  addTuneRow(12, "Target Field", fmtPct(CONFIG.targetField), {
+    { id="tf_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetField", -5, 35, 70) end },
+    { id="tf_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetField", -1, 35, 70) end },
+    { id="tf_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetField", 1, 35, 70) end },
+    { id="tf_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetField", 5, 35, 70) end },
+  })
+
+  addTuneRow(16, "Target Sat", fmtPct(CONFIG.targetSaturation), {
+    { id="ts_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetSaturation", -5, 40, 90) end },
+    { id="ts_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetSaturation", -1, 40, 90) end },
+    { id="ts_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetSaturation", 1, 40, 90) end },
+    { id="ts_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetSaturation", 5, 40, 90) end },
+  })
+
+  addTuneRow(20, "Gain", tostring(CONFIG.targetGain) .. "%", {
+    { id="tg_m10", label="-10", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetGain", -10, 25, 300) end },
+    { id="tg_m1",  label="-1",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetGain", -1, 25, 300) end },
+    { id="tg_p1",  label="+1",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetGain", 1, 25, 300) end },
+    { id="tg_p10", label="+10", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetGain", 10, 25, 300) end },
+  })
+
+  writeAt(3, 23, "Current mode: " .. string.upper(state.mode), colors.lightBlue, colors.black)
+  writeAt(3, 24, "Status: " .. state.statusMsg, state.statusColor, colors.black)
 
   addButton("back", 2, 28, 13, 30, "Back", colors.cyan, colors.black, function()
     uiPage = "main"
-    drawStaticMain()
   end)
 
   addButton("charge", 15, 28, 26, 30, "Charge", colors.yellow, colors.black, function()
@@ -598,76 +654,12 @@ function drawStaticTune()
   end
 end
 
-local function drawDynamic(info)
-  local fp = info and fieldPct(info) or 0
-  local sp = info and saturationPct(info) or 0
-  local fup = info and fuelPct(info) or 0
-  local tpct = info and pct(info.temperature or 0, CONFIG.tempEmergency) or 0
-
-  drawText(2, 3, "Status: ", colors.white, colors.black)
-  drawText(10, 3, string.rep(" ", 24), colors.white, colors.black)
-  drawText(10, 3, info and statusLabel(info.status) or "NO DATA",
-    info and reactorStatusColor(info.status) or colors.red, colors.black)
-
-  drawText(2, 4, "Mode: ", colors.white, colors.black)
-  drawText(8, 4, string.rep(" ", 24), colors.white, colors.black)
-  drawText(8, 4, string.upper(state.mode), colors.yellow, colors.black)
-
-  drawText(2, 6, "Reactor: " .. CONFIG.reactorName .. string.rep(" ", 10), colors.lightGray, colors.black)
-  drawText(2, 7, "Input:   " .. CONFIG.inputGateName .. string.rep(" ", 10), colors.lightGray, colors.black)
-  drawText(2, 8, "Output:  " .. CONFIG.outputGateName .. string.rep(" ", 10), colors.lightGray, colors.black)
-
-  if info then
-    drawText(2, 10, "Temp:       " .. fmtInt(info.temperature or 0) .. " C" .. string.rep(" ", 10), colors.white, colors.black)
-    drawText(2, 11, "Generate:   " .. fmtInt(info.generationRate or 0) .. " RF/t" .. string.rep(" ", 10), colors.white, colors.black)
-    drawText(2, 12, "Drain:      " .. fmtInt(info.fieldDrainRate or 0) .. " RF/t" .. string.rep(" ", 10), colors.white, colors.black)
-    drawText(2, 13, "Fuel Rate:  " .. fmtInt(info.fuelConversionRate or 0) .. " nb/t" .. string.rep(" ", 10), colors.white, colors.black)
-    drawText(2, 14, "Input Set:  " .. fmtInt(gateGet(gateIn)) .. " RF/t" .. string.rep(" ", 10), colors.lightBlue, colors.black)
-    drawText(2, 15, "Output Set: " .. fmtInt(gateGet(gateOut)) .. " RF/t" .. string.rep(" ", 10), colors.lightBlue, colors.black)
-  else
-    for y = 10, 15 do
-      drawText(2, y, string.rep(" ", monW - 3), colors.white, colors.black)
-    end
-  end
-
-  drawBar(2, 17, monW - 4, tpct, colors.red, colors.gray, "TEMP LIMIT")
-  drawBar(2, 19, monW - 4, fp, colors.blue, colors.gray, "FIELD")
-  drawBar(2, 21, monW - 4, sp, colors.green, colors.gray, "SATURATION")
-  drawBar(2, 23, monW - 4, fup, colors.orange, colors.gray, "FUEL")
-
-  drawText(2, 25,
-    ("Targets T:%dC  F:%s  S:%s"):format(CONFIG.targetTemp, fmtPct(CONFIG.targetField), fmtPct(CONFIG.targetSaturation))
-      .. string.rep(" ", 12),
-    colors.yellow, colors.black)
-
-  drawText(2, 26, string.rep(" ", monW - 2), colors.white, colors.black)
-  drawText(2, 26, "Status: " .. state.statusMsg, state.statusColor, colors.black)
-
-  if buttons["auto"] then
-    buttons["auto"].label = state.autoEnabled and "Auto ON" or "Auto OFF"
-    buttons["auto"].bg = state.autoEnabled and colors.green or colors.orange
-    drawButton(buttons["auto"])
-  end
-
+local function redraw()
   if uiPage == "tune" then
-    drawText(2, 8,  "Target Temp", colors.white, colors.black)
-    drawText(20, 8,  tostring(CONFIG.targetTemp) .. string.rep(" ", 10), colors.yellow, colors.black)
-    drawText(2, 12, "Target Field", colors.white, colors.black)
-    drawText(20, 12, fmtPct(CONFIG.targetField) .. string.rep(" ", 10), colors.yellow, colors.black)
-    drawText(2, 16, "Target Saturation", colors.white, colors.black)
-    drawText(20, 16, fmtPct(CONFIG.targetSaturation) .. string.rep(" ", 10), colors.yellow, colors.black)
+    drawTune()
+  else
+    drawMain(lastInfo)
   end
-end
-
-local function redraw(forceStatic)
-  if forceStatic then
-    if uiPage == "tune" then
-      drawStaticTune()
-    else
-      drawStaticMain()
-    end
-  end
-  drawDynamic(lastInfo)
 end
 
 local function handleTouch(side, x, y)
@@ -675,7 +667,7 @@ local function handleTouch(side, x, y)
   for _, b in pairs(buttons) do
     if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
       if b.fn then b.fn() end
-      redraw(false)
+      redraw()
       return
     end
   end
@@ -699,7 +691,7 @@ local function scram(reason)
 
   pcall(function() reactor.stopReactor() end)
   gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.startupInputFloor, 1.20)
+  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.startupHoldInputFloor, 1.20)
   state.lastOutput = 0
 
   setStatus("SCRAM: " .. tostring(state.scramReason), colors.red)
@@ -883,11 +875,11 @@ local function applyStartupHoldControl(info)
   gateSet(gateOut, 0)
   state.lastOutput = 0
 
-  local startupBase = computeBaseInput(info, 55)
-  local wantIn = math.max(startupBase * CONFIG.startupInputMultiplier, CONFIG.startupInputFloor)
+  local base = computeBaseInput(info, 55)
+  local wantIn = math.max(base * CONFIG.startupHoldMultiplier, CONFIG.startupHoldInputFloor)
 
   if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
-    wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.15)
+    wantIn = math.max(wantIn, CONFIG.startupHoldInputFloor * 1.10)
   end
 
   wantIn = clamp(wantIn, 0, CONFIG.maxInput)
@@ -905,8 +897,8 @@ local function applyStartupHoldControl(info)
 
   state.mode = "startup_hold"
   setStatus(
-    ("Startup hold %.1fs  T:%d  F:%.1f%%  S:%.1f%%  In:%s"):format(
-      elapsed, temp, fp, sp, fmtInt(wantIn)
+    ("Startup hold %.1fs  T:%d  F:%.1f%%  S:%.1f%%"):format(
+      elapsed, temp, fp, sp
     ),
     colors.yellow
   )
@@ -918,28 +910,43 @@ local function applyStartupBleedControl(info)
   local temp = info.temperature or 0
   local gen = info.generationRate or 0
   local elapsed = os.clock() - (state.bleedSince or os.clock())
+  local gScale = gainScale()
 
-  local startupBase = computeBaseInput(info, 55)
-  local wantIn = math.max(startupBase * CONFIG.startupInputMultiplier, CONFIG.startupInputFloor)
+  -- Back injector down hard from startup hold.
+  local bleedFieldTarget = math.max(CONFIG.targetField + 8, 52)
+  local baseIn = computeBaseInput(info, bleedFieldTarget)
+  local wantIn = math.max(baseIn * CONFIG.bleedInputMultiplier, CONFIG.bleedInputFloor)
 
-  if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
-    wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.10)
+  if fp < CONFIG.startupRecoverField then
+    wantIn = math.max(wantIn, baseIn * 1.60)
+  end
+  if sp < CONFIG.startupRecoverSat then
+    wantIn = math.max(wantIn, baseIn * 1.40)
   end
 
   wantIn = clamp(wantIn, 0, CONFIG.maxInput)
   gateSet(gateIn, wantIn)
   state.lastInput = wantIn
 
-  local bleedTarget = clamp(
-    state.lastOutput + CONFIG.bleedOutputRampUp,
-    CONFIG.bleedOutputStart,
-    CONFIG.bleedOutputMax
-  )
+  local rampFactor = 1
+  if sp > CONFIG.targetSaturation + 30 then
+    rampFactor = 4
+  elseif sp > CONFIG.targetSaturation + 20 then
+    rampFactor = 3
+  elseif sp > CONFIG.targetSaturation + 10 then
+    rampFactor = 2
+  end
 
-  if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
+  local bleedCap = math.max(CONFIG.bleedOutputMax, gen * (1.0 + gScale))
+  bleedCap = clamp(bleedCap, CONFIG.bleedOutputStart, CONFIG.maxOutput)
+
+  local bleedTarget = state.lastOutput + (CONFIG.bleedOutputRampUp * rampFactor)
+
+  if fp < CONFIG.startupRecoverField - 2 or sp < CONFIG.startupRecoverSat - 8 then
     bleedTarget = math.max(0, state.lastOutput - CONFIG.bleedOutputRampUp * 2)
   end
 
+  bleedTarget = clamp(bleedTarget, 0, bleedCap)
   gateSet(gateOut, bleedTarget)
   state.lastOutput = bleedTarget
 
@@ -947,11 +954,15 @@ local function applyStartupBleedControl(info)
     elapsed >= CONFIG.bleedMinSeconds
     and gen >= CONFIG.startupExitGeneration
     and fp >= CONFIG.startupExitField
-    and sp <= CONFIG.startupExitSaturationHi
-    and sp >= CONFIG.startupExitSaturationLo
     and isRunningStatus(info.status)
 
-  if readyForRun then
+  local timeoutFallback =
+    elapsed >= CONFIG.bleedTimeoutSeconds
+    and gen > 0
+    and fp >= 40
+    and isRunningStatus(info.status)
+
+  if readyForRun or timeoutFallback then
     state.mode = "run"
     resetPIDs()
     setStatus("Startup complete - run mode", colors.lime)
@@ -960,8 +971,8 @@ local function applyStartupBleedControl(info)
 
   state.mode = "startup_bleed"
   setStatus(
-    ("Startup bleed %.1fs  T:%d  G:%s  F:%.1f%%  S:%.1f%%  Out:%s"):format(
-      elapsed, temp, fmtInt(gen), fp, sp, fmtInt(bleedTarget)
+    ("Startup bleed %.1fs  T:%d  G:%s  F:%.1f%%  S:%.1f%%  In:%s  Out:%s"):format(
+      elapsed, temp, fmtInt(gen), fp, sp, fmtInt(wantIn), fmtInt(bleedTarget)
     ),
     colors.yellow
   )
@@ -973,16 +984,23 @@ local function applyRunControl(info, dt)
   local fup = fuelPct(info)
   local temp = info.temperature or 0
   local gen = info.generationRate or 0
+  local gScale = gainScale()
 
   local wantIn, baseIn = computeRunInput(info, dt)
 
   local outSatTrim  = pidUpdate(pidOutSat, sp - CONFIG.targetSaturation, dt)
   local outTempTrim = pidUpdate(pidOutTemp, CONFIG.targetTemp - temp, dt)
 
-  local rawOutTarget = state.lastOutput + outSatTrim + outTempTrim
+  local rawOutTarget = state.lastOutput + ((outSatTrim + outTempTrim) * gScale)
 
-  local dynamicOutMax = math.max(gen * 0.75, 25000)
+  local dynamicOutMax = math.max(gen * (0.75 + 0.50 * gScale), 25000)
   dynamicOutMax = clamp(dynamicOutMax, 0, CONFIG.maxOutput)
+
+  if sp > CONFIG.targetSaturation + 20 and temp < CONFIG.targetTemp - 200 then
+    rawOutTarget = math.max(rawOutTarget, gen * (1.00 + 0.50 * gScale))
+  elseif sp > CONFIG.targetSaturation + 10 and temp < CONFIG.targetTemp then
+    rawOutTarget = math.max(rawOutTarget, gen * (0.85 + 0.35 * gScale))
+  end
 
   if sp < CONFIG.targetSaturation - 5 then
     rawOutTarget = math.min(rawOutTarget, gen * 0.45)
@@ -1013,7 +1031,9 @@ local function applyRunControl(info, dt)
   state.scramReason = nil
 
   setStatus(
-    ("Run | T:%d F:%.1f%% S:%.1f%% Fuel:%.1f%%"):format(temp, fp, sp, fup),
+    ("Run | T:%d F:%.1f%% S:%.1f%% Fuel:%.1f%% Out:%s"):format(
+      temp, fp, sp, fup, fmtInt(wantOut)
+    ),
     colors.lime
   )
 end
@@ -1127,9 +1147,8 @@ local function controlLoop()
 end
 
 local function uiLoop()
-  redraw(true)
   while running do
-    redraw(false)
+    redraw()
     sleep(CONFIG.uiRate)
   end
 end
@@ -1143,7 +1162,7 @@ local function eventLoop()
     elseif e[1] == "monitor_resize" then
       pcall(monitor.setTextScale, CONFIG.monitorScale)
       monW, monH = monitor.getSize()
-      redraw(true)
+      redraw()
     elseif e[1] == "terminate" then
       running = false
       gateSet(gateOut, 0)
