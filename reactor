@@ -4,7 +4,7 @@
 --
 --  IMPORTANT:
 --  - inputGateName  = gate feeding the Energy Injector
---  - outputGateName = gate extracting power from the Stabilizer side
+--  - outputGateName = gate extracting RF from the Stabilizer side
 --  - Edit ONLY the CONFIG section below
 --========================================================--
 
@@ -13,14 +13,14 @@ local CONFIG = {
   -- REQUIRED PERIPHERAL NAMES
   ----------------------------------------------------------
   reactorName    = "draconic_reactor_0",
-  inputGateName  = "flow_gate_0",   -- injector side
-  outputGateName = "flow_gate_1",   -- stabilizer/output side
+  inputGateName  = "flow_gate_0",
+  outputGateName = "flow_gate_1",
 
   ----------------------------------------------------------
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "3.0",
+  version      = "4.0",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -31,45 +31,46 @@ local CONFIG = {
   targetSaturation  = 58,
 
   ----------------------------------------------------------
-  -- CHARGE READY THRESHOLDS
+  -- READY THRESHOLDS
   ----------------------------------------------------------
   chargeReadyTemp       = 2000,
   chargeReadyField      = 50,
   chargeReadySaturation = 50,
 
   ----------------------------------------------------------
-  -- STARTUP / ACTIVATE SAFETY
-  -- This is the key fix: force a large injector feed right
-  -- after activation, and keep output at 0 until stable.
+  -- ACTIVATE / STARTUP FIX
   ----------------------------------------------------------
-  startupInputFloor       = 50000000,  -- 50M RF/t minimum immediately on activate
-  startupInputMultiplier  = 1.60,      -- multiplier on field-derived base input
-  startupHoldSeconds      = 18,        -- keep startup mode this long minimum
-  startupExitTemp         = 5000,
-  startupExitField        = 42,
-  startupExitSaturation   = 72,
-  startupOutputCap        = 0,         -- hard-lock output to 0 during startup
-  startupRecoverField     = 48,
-  startupRecoverSat       = 80,
+  activatePrimeInputFloor   = 64000000, -- set BEFORE activate
+  activatePrimeMultiplier   = 1.75,
+  activatePrimeSeconds      = 0.60,     -- hold pre-activation
+  startupInputFloor         = 64000000, -- hold AFTER activate
+  startupInputMultiplier    = 1.50,
+  startupHoldSeconds        = 20,
+  startupExitTemp           = 5000,
+  startupExitField          = 42,
+  startupExitSaturation     = 72,
+  startupRecoverField       = 48,
+  startupRecoverSat         = 80,
+  startupOutputCap          = 0,        -- no output during startup
 
   ----------------------------------------------------------
-  -- CHARGING / COOLING INPUT FLOORS
+  -- CHARGING / COOLING
   ----------------------------------------------------------
-  minChargeRate        = 1000000,
-  cooldownInputFloor   = 8000000,
+  minChargeRate       = 1000000,
+  cooldownInputFloor  = 8000000,
 
   ----------------------------------------------------------
   -- EMERGENCY LIMITS
   ----------------------------------------------------------
-  tempEmergency        = 7900,
-  fieldEmergency       = 20,
-  saturationEmergency  = 10,
+  tempEmergency       = 7900,
+  fieldEmergency      = 20,
+  saturationEmergency = 10,
 
   ----------------------------------------------------------
   -- LOW FUEL SAFETY
   ----------------------------------------------------------
-  fuelSafeShutdown     = 8,
-  fuelCritical         = 4,
+  fuelSafeShutdown    = 8,
+  fuelCritical        = 4,
 
   ----------------------------------------------------------
   -- LOOP TIMING
@@ -82,7 +83,7 @@ local CONFIG = {
   ----------------------------------------------------------
   maxInput             = 2147483000,
   maxOutput            = 2147483000,
-  inputBaseFloorFactor = 1.15,
+  inputBaseFloorFactor = 1.12,
   outputRampUp         = 60000,
   outputRampDown       = 250000,
 
@@ -121,12 +122,13 @@ local state = {
   safeStopLatch = false,
   scramReason = nil,
 
-  mode = "idle", -- idle, charging, ready, startup, run, stopping, cooling, scram
+  mode = "idle", -- idle, charging, ready, priming, startup, run, stopping, cooling, scram
   readyToActivate = false,
   activateRequested = false,
   chargeRequested = false,
 
   startupSince = nil,
+  primeUntil = nil,
 
   lastInput = 0,
   lastOutput = 0,
@@ -679,10 +681,11 @@ local function scram(reason)
   state.activateRequested = false
   state.chargeRequested = false
   state.startupSince = nil
+  state.primeUntil = nil
 
   pcall(function() reactor.stopReactor() end)
   gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.startupInputFloor, 1.30)
+  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.startupInputFloor, 1.20)
   state.lastOutput = 0
 
   setStatus("SCRAM: " .. tostring(state.scramReason), colors.red)
@@ -693,10 +696,11 @@ local function safeShutdown(reason)
   state.readyToActivate = false
   state.activateRequested = false
   state.startupSince = nil
+  state.primeUntil = nil
 
   pcall(function() reactor.stopReactor() end)
   gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.cooldownInputFloor, 1.10)
+  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.cooldownInputFloor, 1.08)
   state.lastOutput = 0
   state.mode = "stopping"
 
@@ -709,6 +713,7 @@ local function processOperatorRequests(info)
     state.activateRequested = false
     state.readyToActivate = false
     state.startupSince = nil
+    state.primeUntil = nil
     state.mode = "charging"
     resetPIDs()
 
@@ -733,19 +738,13 @@ local function processOperatorRequests(info)
       return
     end
 
-    pcall(function() reactor.activateReactor() end)
-
-    state.readyToActivate = false
-    state.mode = "startup"
-    state.startupSince = os.clock()
-    resetPIDs()
-
-    -- critical fix: slam injector high immediately, output hard zero
+    -- Prime injector BEFORE activate. This is the main fix.
     gateSet(gateOut, 0)
-    holdInputSafe(info, 55, CONFIG.startupInputFloor, CONFIG.startupInputMultiplier)
+    holdInputSafe(info, 55, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
     state.lastOutput = 0
-
-    setStatus("Activated - startup hold engaged", colors.lime)
+    state.mode = "priming"
+    state.primeUntil = os.clock() + CONFIG.activatePrimeSeconds
+    setStatus("Priming injector before activation", colors.yellow)
   end
 end
 
@@ -801,8 +800,6 @@ end
 
 local function applyChargingControl(info)
   gateSet(gateOut, 0)
-
-  -- keep feeding charge, but don't arm READY unless actually in warmup
   holdInputSafe(info, 55, CONFIG.minChargeRate, 1.25)
   state.lastOutput = 0
 
@@ -845,13 +842,28 @@ local function computeRunInput(info, dt)
   return wantIn, baseIn
 end
 
-local function applyStartupControl(info, dt)
+local function applyPrimingControl(info)
+  gateSet(gateOut, 0)
+  holdInputSafe(info, 55, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
+  state.lastOutput = 0
+
+  if os.clock() >= (state.primeUntil or 0) then
+    pcall(function() reactor.activateReactor() end)
+    state.primeUntil = nil
+    state.startupSince = os.clock()
+    state.mode = "startup"
+    setStatus("Activated - startup hold engaged", colors.lime)
+  else
+    setStatus("Priming injector before activation", colors.yellow)
+  end
+end
+
+local function applyStartupControl(info)
   local fp = fieldPct(info)
   local sp = saturationPct(info)
   local temp = info.temperature or 0
   local elapsed = os.clock() - (state.startupSince or os.clock())
 
-  -- During startup: NO output. Keep injector very high.
   gateSet(gateOut, CONFIG.startupOutputCap)
   state.lastOutput = CONFIG.startupOutputCap
 
@@ -861,9 +873,8 @@ local function applyStartupControl(info, dt)
     CONFIG.startupInputFloor
   )
 
-  -- if field or saturation dip, push injector even harder
   if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
-    wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.20)
+    wantIn = math.max(wantIn, CONFIG.startupInputFloor * 1.15)
   end
 
   wantIn = clamp(wantIn, 0, CONFIG.maxInput)
@@ -963,6 +974,11 @@ local function applyControl(info, dt)
     return
   end
 
+  if state.mode == "priming" then
+    applyPrimingControl(info)
+    return
+  end
+
   if status == "cold" then
     gateSet(gateIn, 0)
     gateSet(gateOut, 0)
@@ -970,12 +986,12 @@ local function applyControl(info, dt)
     state.lastOutput = 0
     state.readyToActivate = false
     state.startupSince = nil
+    state.primeUntil = nil
+    state.mode = "idle"
 
     if state.safeStopLatch then
-      state.mode = "idle"
       setStatus("Reactor offline (safe stop)", colors.orange)
     else
-      state.mode = "idle"
       setStatus("Reactor offline", colors.lightGray)
     end
     return
@@ -995,7 +1011,7 @@ local function applyControl(info, dt)
 
   if isRunningStatus(status) then
     if state.mode == "startup" or state.startupSince ~= nil then
-      applyStartupControl(info, dt)
+      applyStartupControl(info)
       return
     end
 
@@ -1003,7 +1019,6 @@ local function applyControl(info, dt)
     return
   end
 
-  -- Unknown status: do not keep stale READY
   state.readyToActivate = false
   state.mode = "idle"
   setStatus("Unhandled status: " .. tostring(status), colors.orange)
