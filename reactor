@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "6.0",
+  version      = "6.1",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -29,7 +29,7 @@ local CONFIG = {
   targetTemp        = 7600,
   targetField       = 45,
   targetSaturation  = 58,
-  targetGain        = 100,   -- 100 = normal, higher = more aggressive output chase
+  targetGain        = 100,
 
   ----------------------------------------------------------
   -- READY THRESHOLDS
@@ -49,7 +49,6 @@ local CONFIG = {
   startupHoldMultiplier   = 1.45,
   startupHoldSeconds      = 4.0,
 
-  -- Startup bleed: deliberately back injector down and open output
   bleedInputFloor         = 8000000,
   bleedInputMultiplier    = 1.30,
   bleedOutputStart        = 250000,
@@ -120,6 +119,9 @@ local buttons = {}
 local running = true
 local uiPage = "main"
 local lastInfo = nil
+local uiDirty = true
+local lastStaticPage = nil
+local screenCache = {}
 
 local state = {
   statusMsg = "Booting...",
@@ -187,6 +189,7 @@ end
 local function setStatus(msg, col)
   state.statusMsg = msg or ""
   state.statusColor = col or colors.white
+  uiDirty = true
 end
 
 local function slew(current, target, upRate, downRate)
@@ -436,25 +439,34 @@ local function holdInputSafe(info, targetFieldValue, floorValue, multiplier)
 end
 
 --========================================================--
--- UI
+-- LOW-FLICKER UI
 --========================================================--
 
 local function clearButtons()
   buttons = {}
 end
 
-local function writeAt(x, y, text, fg, bg)
+local function cacheWrite(key, x, y, text, fg, bg)
+  local sig = tostring(text) .. "|" .. tostring(fg or "") .. "|" .. tostring(bg or "")
+  if screenCache[key] == sig then return end
+  screenCache[key] = sig
   if bg then monitor.setBackgroundColor(bg) end
   if fg then monitor.setTextColor(fg) end
   monitor.setCursorPos(x, y)
   monitor.write(text)
 end
 
+local function clearCache()
+  screenCache = {}
+end
+
+local function writeAt(x, y, text, fg, bg)
+  cacheWrite(("T:%d:%d"):format(x, y), x, y, text, fg, bg)
+end
+
 local function fillRect(x1, y1, x2, y2, bg)
-  monitor.setBackgroundColor(bg)
   for y = y1, y2 do
-    monitor.setCursorPos(x1, y)
-    monitor.write((" "):rep(x2 - x1 + 1))
+    cacheWrite(("F:%d:%d:%d"):format(x1, y, x2), x1, y, (" "):rep(x2 - x1 + 1), nil, bg)
   end
 end
 
@@ -476,14 +488,9 @@ local function drawBar(x, y, w, valuePct, fillColor, backColor, label)
   valuePct = clamp(valuePct or 0, 0, 100)
   local fillW = math.floor((w * valuePct) / 100)
 
-  monitor.setBackgroundColor(backColor)
-  monitor.setCursorPos(x, y)
-  monitor.write((" "):rep(w))
-
-  if fillW > 0 then
-    monitor.setBackgroundColor(fillColor)
-    monitor.setCursorPos(x, y)
-    monitor.write((" "):rep(fillW))
+  for i = 0, w - 1 do
+    local bg = (i < fillW) and fillColor or backColor
+    cacheWrite(("B:%d:%d:%d"):format(x + i, y, i), x + i, y, " ", colors.white, bg)
   end
 
   local txt = label .. " " .. string.format("%5.1f%%", valuePct)
@@ -491,59 +498,37 @@ local function drawBar(x, y, w, valuePct, fillColor, backColor, label)
   writeAt(tx, y, txt, colors.white, colors.black)
 end
 
-local function drawMain(info)
+local function drawMainStatic()
   clearButtons()
+  clearCache()
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
-
-  local fp = info and fieldPct(info) or 0
-  local sp = info and saturationPct(info) or 0
-  local fup = info and fuelPct(info) or 0
-  local tpct = info and pct(info.temperature or 0, CONFIG.tempEmergency) or 0
 
   writeAt(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
   writeAt(math.max(2, monW - 8), 1, "MAIN", colors.lightGray, colors.black)
 
-  writeAt(2, 3, "Status: ", colors.white, colors.black)
-  writeAt(10, 3, info and statusLabel(info.status) or "NO DATA",
-    info and reactorStatusColor(info.status) or colors.red, colors.black)
+  writeAt(2, 3, "Status:", colors.white, colors.black)
+  writeAt(2, 4, "Mode:", colors.white, colors.black)
 
-  writeAt(2, 4, "Mode: ", colors.white, colors.black)
-  writeAt(8, 4, string.upper(state.mode), colors.yellow, colors.black)
+  writeAt(2, 6, "Reactor:", colors.lightGray, colors.black)
+  writeAt(2, 7, "Input:", colors.lightGray, colors.black)
+  writeAt(2, 8, "Output:", colors.lightGray, colors.black)
 
-  writeAt(2, 6, "Reactor: " .. CONFIG.reactorName, colors.lightGray, colors.black)
-  writeAt(2, 7, "Input:   " .. CONFIG.inputGateName, colors.lightGray, colors.black)
-  writeAt(2, 8, "Output:  " .. CONFIG.outputGateName, colors.lightGray, colors.black)
-
-  if info then
-    writeAt(2, 10, "Temp:       " .. fmtInt(info.temperature or 0) .. " C", colors.white, colors.black)
-    writeAt(2, 11, "Generate:   " .. fmtInt(info.generationRate or 0) .. " RF/t", colors.white, colors.black)
-    writeAt(2, 12, "Drain:      " .. fmtInt(info.fieldDrainRate or 0) .. " RF/t", colors.white, colors.black)
-    writeAt(2, 13, "Fuel Rate:  " .. fmtInt(info.fuelConversionRate or 0) .. " nb/t", colors.white, colors.black)
-    writeAt(2, 14, "Input Set:  " .. fmtInt(gateGet(gateIn)) .. " RF/t", colors.lightBlue, colors.black)
-    writeAt(2, 15, "Output Set: " .. fmtInt(gateGet(gateOut)) .. " RF/t", colors.lightBlue, colors.black)
-  end
-
-  drawBar(2, 17, monW - 4, tpct, colors.red, colors.gray, "TEMP LIMIT")
-  drawBar(2, 19, monW - 4, fp, colors.blue, colors.gray, "FIELD")
-  drawBar(2, 21, monW - 4, sp, colors.green, colors.gray, "SATURATION")
-  drawBar(2, 23, monW - 4, fup, colors.orange, colors.gray, "FUEL")
-
-  writeAt(2, 25,
-    ("Targets T:%dC  F:%s  S:%s  G:%d%%"):format(
-      CONFIG.targetTemp, fmtPct(CONFIG.targetField), fmtPct(CONFIG.targetSaturation), CONFIG.targetGain
-    ),
-    colors.yellow, colors.black
-  )
-
-  writeAt(2, 26, "Status: " .. state.statusMsg, state.statusColor, colors.black)
+  writeAt(2, 10, "Temp:", colors.white, colors.black)
+  writeAt(2, 11, "Generate:", colors.white, colors.black)
+  writeAt(2, 12, "Drain:", colors.white, colors.black)
+  writeAt(2, 13, "Fuel Rate:", colors.white, colors.black)
+  writeAt(2, 14, "Input Set:", colors.lightBlue, colors.black)
+  writeAt(2, 15, "Output Set:", colors.lightBlue, colors.black)
 
   addButton("charge", 2, 28, 13, 30, "Charge", colors.yellow, colors.black, function()
     state.chargeRequested = true
+    uiDirty = true
   end)
 
   addButton("activate", 15, 28, 28, 30, "Activate", colors.lime, colors.black, function()
     state.activateRequested = true
+    uiDirty = true
   end)
 
   addButton("scram", 30, 28, 41, 30, "SCRAM", colors.red, colors.white, function()
@@ -551,6 +536,7 @@ local function drawMain(info)
     state.chargeRequested = false
     state.mode = "scram"
     state.scramReason = "Operator SCRAM"
+    uiDirty = true
   end)
 
   addButton("auto", 43, 28, 55, 30,
@@ -562,11 +548,13 @@ local function drawMain(info)
       resetPIDs()
       setStatus(state.autoEnabled and "Auto enabled" or "Auto paused",
         state.autoEnabled and colors.lime or colors.orange)
+      uiDirty = true
     end
   )
 
   addButton("tune", 57, 28, math.max(68, monW - 2), 30, "Tune", colors.cyan, colors.black, function()
     uiPage = "tune"
+    uiDirty = true
   end)
 
   for _, b in pairs(buttons) do
@@ -574,23 +562,73 @@ local function drawMain(info)
   end
 end
 
-local function tuneAdjust(key, delta, minVal, maxVal)
-  CONFIG[key] = clamp((CONFIG[key] or 0) + delta, minVal, maxVal)
+local function drawMainDynamic(info)
+  local fp = info and fieldPct(info) or 0
+  local sp = info and saturationPct(info) or 0
+  local fup = info and fuelPct(info) or 0
+  local tpct = info and pct(info.temperature or 0, CONFIG.tempEmergency) or 0
+
+  writeAt(10, 3, (" "):rep(24), colors.white, colors.black)
+  writeAt(10, 3, info and statusLabel(info.status) or "NO DATA",
+    info and reactorStatusColor(info.status) or colors.red, colors.black)
+
+  writeAt(8, 4, (" "):rep(24), colors.white, colors.black)
+  writeAt(8, 4, string.upper(state.mode), colors.yellow, colors.black)
+
+  writeAt(11, 6, CONFIG.reactorName .. (" "):rep(20), colors.lightGray, colors.black)
+  writeAt(11, 7, CONFIG.inputGateName .. (" "):rep(20), colors.lightGray, colors.black)
+  writeAt(11, 8, CONFIG.outputGateName .. (" "):rep(20), colors.lightGray, colors.black)
+
+  if info then
+    writeAt(14, 10, fmtInt(info.temperature or 0) .. " C" .. (" "):rep(16), colors.white, colors.black)
+    writeAt(14, 11, fmtInt(info.generationRate or 0) .. " RF/t" .. (" "):rep(12), colors.white, colors.black)
+    writeAt(14, 12, fmtInt(info.fieldDrainRate or 0) .. " RF/t" .. (" "):rep(12), colors.white, colors.black)
+    writeAt(14, 13, fmtInt(info.fuelConversionRate or 0) .. " nb/t" .. (" "):rep(12), colors.white, colors.black)
+    writeAt(14, 14, fmtInt(gateGet(gateIn)) .. " RF/t" .. (" "):rep(12), colors.lightBlue, colors.black)
+    writeAt(14, 15, fmtInt(gateGet(gateOut)) .. " RF/t" .. (" "):rep(12), colors.lightBlue, colors.black)
+  end
+
+  drawBar(2, 17, monW - 4, tpct, colors.red, colors.gray, "TEMP LIMIT")
+  drawBar(2, 19, monW - 4, fp, colors.blue, colors.gray, "FIELD")
+  drawBar(2, 21, monW - 4, sp, colors.green, colors.gray, "SATURATION")
+  drawBar(2, 23, monW - 4, fup, colors.orange, colors.gray, "FUEL")
+
+  writeAt(2, 25,
+    ("Targets T:%dC  F:%s  S:%s  G:%d%%"):format(
+      CONFIG.targetTemp, fmtPct(CONFIG.targetField), fmtPct(CONFIG.targetSaturation), CONFIG.targetGain
+    ) .. (" "):rep(8),
+    colors.yellow, colors.black
+  )
+
+  writeAt(2, 26, (" "):rep(monW - 2), colors.white, colors.black)
+  writeAt(2, 26, "Status: " .. state.statusMsg, state.statusColor, colors.black)
+
+  if buttons["auto"] then
+    buttons["auto"].label = state.autoEnabled and "Auto ON" or "Auto OFF"
+    buttons["auto"].bg = state.autoEnabled and colors.green or colors.orange
+    drawButton(buttons["auto"])
+  end
 end
 
-local function addTuneRow(y, label, value, buttonsDef)
+local function tuneAdjust(key, delta, minVal, maxVal)
+  CONFIG[key] = clamp((CONFIG[key] or 0) + delta, minVal, maxVal)
+  uiDirty = true
+end
+
+local function addTuneRow(y, label, value, defs)
   writeAt(3, y, label, colors.white, colors.black)
-  writeAt(24, y, value, colors.yellow, colors.black)
+  writeAt(24, y, value .. (" "):rep(10), colors.yellow, colors.black)
 
   local x = 34
-  for _, def in ipairs(buttonsDef) do
+  for _, def in ipairs(defs) do
     addButton(def.id, x, y - 1, x + 5, y, def.label, def.bg, def.fg, def.fn)
     x = x + 7
   end
 end
 
-local function drawTune()
+local function drawTuneStatic()
   clearButtons()
+  clearCache()
   monitor.setBackgroundColor(colors.black)
   monitor.clear()
 
@@ -600,6 +638,27 @@ local function drawTune()
   writeAt(3, 3, "Live tuning page", colors.white, colors.black)
   writeAt(3, 4, "Targets update immediately while running.", colors.lightGray, colors.black)
   writeAt(3, 5, "Gain = output aggressiveness.", colors.lightGray, colors.black)
+
+  addButton("back", 2, 28, 13, 30, "Back", colors.cyan, colors.black, function()
+    uiPage = "main"
+    uiDirty = true
+  end)
+
+  addButton("charge", 15, 28, 26, 30, "Charge", colors.yellow, colors.black, function()
+    state.chargeRequested = true
+    uiDirty = true
+  end)
+
+  addButton("activate", 28, 28, 41, 30, "Activate", colors.lime, colors.black, function()
+    state.activateRequested = true
+    uiDirty = true
+  end)
+
+  addButton("scram", 43, 28, 54, 30, "SCRAM", colors.red, colors.white, function()
+    state.mode = "scram"
+    state.scramReason = "Operator SCRAM"
+    uiDirty = true
+  end)
 
   addTuneRow(8, "Target Temp", tostring(CONFIG.targetTemp), {
     { id="tt_m10", label="-10", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetTemp", -10, 7000, 7900) end },
@@ -629,36 +688,39 @@ local function drawTune()
     { id="tg_p10", label="+10", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetGain", 10, 25, 300) end },
   })
 
-  writeAt(3, 23, "Current mode: " .. string.upper(state.mode), colors.lightBlue, colors.black)
-  writeAt(3, 24, "Status: " .. state.statusMsg, state.statusColor, colors.black)
-
-  addButton("back", 2, 28, 13, 30, "Back", colors.cyan, colors.black, function()
-    uiPage = "main"
-  end)
-
-  addButton("charge", 15, 28, 26, 30, "Charge", colors.yellow, colors.black, function()
-    state.chargeRequested = true
-  end)
-
-  addButton("activate", 28, 28, 41, 30, "Activate", colors.lime, colors.black, function()
-    state.activateRequested = true
-  end)
-
-  addButton("scram", 43, 28, 54, 30, "SCRAM", colors.red, colors.white, function()
-    state.mode = "scram"
-    state.scramReason = "Operator SCRAM"
-  end)
-
   for _, b in pairs(buttons) do
     drawButton(b)
   end
 end
 
-local function redraw()
+local function drawTuneDynamic()
+  writeAt(24, 8, tostring(CONFIG.targetTemp) .. (" "):rep(10), colors.yellow, colors.black)
+  writeAt(24, 12, fmtPct(CONFIG.targetField) .. (" "):rep(10), colors.yellow, colors.black)
+  writeAt(24, 16, fmtPct(CONFIG.targetSaturation) .. (" "):rep(10), colors.yellow, colors.black)
+  writeAt(24, 20, tostring(CONFIG.targetGain) .. "%" .. (" "):rep(10), colors.yellow, colors.black)
+
+  writeAt(3, 23, "Current mode: " .. string.upper(state.mode) .. (" "):rep(20), colors.lightBlue, colors.black)
+  writeAt(3, 24, (" "):rep(monW - 4), colors.white, colors.black)
+  writeAt(3, 24, "Status: " .. state.statusMsg, state.statusColor, colors.black)
+end
+
+local function redraw(forceStatic)
+  forceStatic = forceStatic or false
+
+  if forceStatic or lastStaticPage ~= uiPage then
+    if uiPage == "tune" then
+      drawTuneStatic()
+    else
+      drawMainStatic()
+    end
+    lastStaticPage = uiPage
+    uiDirty = true
+  end
+
   if uiPage == "tune" then
-    drawTune()
+    drawTuneDynamic()
   else
-    drawMain(lastInfo)
+    drawMainDynamic(lastInfo)
   end
 end
 
@@ -667,7 +729,7 @@ local function handleTouch(side, x, y)
   for _, b in pairs(buttons) do
     if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
       if b.fn then b.fn() end
-      redraw()
+      redraw(uiPage ~= lastStaticPage)
       return
     end
   end
@@ -729,6 +791,7 @@ local function processOperatorRequests(info)
     gateSet(gateOut, 0)
     holdInputSafe(info, 55, CONFIG.minChargeRate, 1.25)
     state.lastOutput = 0
+    uiDirty = true
     setStatus("Charging reactor", colors.yellow)
   end
 
@@ -751,6 +814,7 @@ local function processOperatorRequests(info)
     state.lastOutput = 0
     state.mode = "priming"
     state.primeUntil = os.clock() + CONFIG.activatePrimeSeconds
+    uiDirty = true
     setStatus("Priming injector before activation", colors.yellow)
   end
 end
@@ -813,6 +877,7 @@ local function applyChargingControl(info)
   if chargeReady(info) then
     state.readyToActivate = true
     state.mode = "ready"
+    uiDirty = true
     setStatus("READY - press Activate", colors.lime)
   else
     state.readyToActivate = false
@@ -860,6 +925,7 @@ local function applyPrimingControl(info)
     state.startupSince = os.clock()
     state.bleedSince = nil
     state.mode = "startup_hold"
+    uiDirty = true
     setStatus("Activated - startup hold", colors.lime)
   else
     setStatus("Priming injector before activation", colors.yellow)
@@ -891,6 +957,7 @@ local function applyStartupHoldControl(info)
     state.bleedSince = os.clock()
     state.lastOutput = CONFIG.bleedOutputStart
     gateSet(gateOut, CONFIG.bleedOutputStart)
+    uiDirty = true
     setStatus("Startup bleed phase", colors.yellow)
     return
   end
@@ -912,7 +979,6 @@ local function applyStartupBleedControl(info)
   local elapsed = os.clock() - (state.bleedSince or os.clock())
   local gScale = gainScale()
 
-  -- Back injector down hard from startup hold.
   local bleedFieldTarget = math.max(CONFIG.targetField + 8, 52)
   local baseIn = computeBaseInput(info, bleedFieldTarget)
   local wantIn = math.max(baseIn * CONFIG.bleedInputMultiplier, CONFIG.bleedInputFloor)
@@ -965,6 +1031,7 @@ local function applyStartupBleedControl(info)
   if readyForRun or timeoutFallback then
     state.mode = "run"
     resetPIDs()
+    uiDirty = true
     setStatus("Startup complete - run mode", colors.lime)
     return
   end
@@ -1050,6 +1117,7 @@ local function applyControl(info, dt)
 
   if state.lowFuelLatch and fup > (CONFIG.fuelSafeShutdown + 5) and (status == "cold" or status == "cooling") then
     state.lowFuelLatch = false
+    uiDirty = true
     setStatus("Fuel latch cleared", colors.lime)
   end
 
@@ -1073,6 +1141,7 @@ local function applyControl(info, dt)
     state.bleedSince = nil
     state.primeUntil = nil
     state.mode = "idle"
+    uiDirty = true
 
     if state.safeStopLatch then
       setStatus("Reactor offline (safe stop)", colors.orange)
@@ -1090,6 +1159,7 @@ local function applyControl(info, dt)
   if status == "stopping" or status == "cooling" then
     state.readyToActivate = false
     state.mode = (status == "stopping") and "stopping" or "cooling"
+    uiDirty = true
     applyCoolingControl(info)
     return
   end
@@ -1116,6 +1186,7 @@ local function applyControl(info, dt)
 
   state.readyToActivate = false
   state.mode = "idle"
+  uiDirty = true
   setStatus("Unhandled status: " .. tostring(status), colors.orange)
 end
 
@@ -1147,8 +1218,35 @@ local function controlLoop()
 end
 
 local function uiLoop()
+  local lastSnapshot = ""
+
   while running do
-    redraw()
+    local info = lastInfo
+    local snapshot = table.concat({
+      uiPage,
+      state.mode,
+      state.statusMsg,
+      tostring(state.statusColor),
+      tostring(state.autoEnabled),
+      tostring(CONFIG.targetTemp),
+      tostring(CONFIG.targetField),
+      tostring(CONFIG.targetSaturation),
+      tostring(CONFIG.targetGain),
+      info and tostring(math.floor(info.temperature or 0)) or "nil",
+      info and tostring(math.floor((info.generationRate or 0) / 1000)) or "nil",
+      info and tostring(math.floor((fieldPct(info) or 0) * 10)) or "nil",
+      info and tostring(math.floor((saturationPct(info) or 0) * 10)) or "nil",
+      info and tostring(math.floor((fuelPct(info) or 0) * 10)) or "nil",
+      tostring(math.floor(gateGet(gateIn) or 0)),
+      tostring(math.floor(gateGet(gateOut) or 0))
+    }, "|")
+
+    if uiDirty or snapshot ~= lastSnapshot then
+      redraw(false)
+      lastSnapshot = snapshot
+      uiDirty = false
+    end
+
     sleep(CONFIG.uiRate)
   end
 end
@@ -1162,7 +1260,9 @@ local function eventLoop()
     elseif e[1] == "monitor_resize" then
       pcall(monitor.setTextScale, CONFIG.monitorScale)
       monW, monH = monitor.getSize()
-      redraw()
+      lastStaticPage = nil
+      uiDirty = true
+      redraw(true)
     elseif e[1] == "terminate" then
       running = false
       gateSet(gateOut, 0)
@@ -1190,4 +1290,5 @@ print("")
 print("Ready.")
 
 setStatus("System ready", colors.lime)
+redraw(true)
 parallel.waitForAny(controlLoop, uiLoop, eventLoop)
