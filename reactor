@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "8.2",
+  version      = "8.3",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -120,11 +120,16 @@ local CONFIG = {
   ----------------------------------------------------------
   -- OUTPUT BIAS CONTROL
   ----------------------------------------------------------
-  outputBiasStepUpBase       = 140000,
+  outputBiasStepUpBase       = 220000,
   outputBiasStepDownBase     = 140000,
   outputBiasStepDownFast     = 450000,
-  outputBiasMaxFactorBase    = 0.72,  -- max output as fraction of generation before gain multiplier
-  outputBiasHeatPushFactor   = 0.92,  -- when reactor is cool but safe, allow more output push
+  outputBiasMaxFactorBase    = 0.72,   -- normal max output as fraction of generation before gain multiplier
+  outputBiasHeatPushFactor   = 0.92,   -- when reactor is cool but safe, allow more output push
+  outputDemandPerSatPct      = 90000,  -- extra output demand per % saturation above target
+  outputDemandPerTempC       = 180,    -- extra output demand per degree below target temp
+  outputCapPerSatPct         = 120000, -- absolute cap growth per % saturation above target
+  outputCapPerTempC          = 220,    -- absolute cap growth per degree below target temp
+  outputHeatCapMax           = 8000000,-- max pull used to drive a cold, over-saturated reactor hotter
 
   ----------------------------------------------------------
   -- PID TUNING
@@ -1231,10 +1236,19 @@ local function applyRunControl(info, dt)
 
   local outputFactorMax = CONFIG.outputBiasMaxFactorBase + ((gScale - 1.0) * 0.22)
   outputFactorMax = clamp(outputFactorMax, 0.25, 0.95)
+
+  local satSurplus = math.max(0, fSat - CONFIG.targetSaturation)
+  local tempDeficit = math.max(0, CONFIG.targetTemp - fTemp)
+
   local maxAllowedOut = gen * outputFactorMax
 
   if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > recoverExit then
     maxAllowedOut = math.max(maxAllowedOut, gen * CONFIG.outputBiasHeatPushFactor)
+  end
+
+  if fField > recoverExit and fSat > CONFIG.targetSaturation + 5 then
+    local demandCap = (satSurplus * CONFIG.outputCapPerSatPct) + (tempDeficit * CONFIG.outputCapPerTempC)
+    maxAllowedOut = math.max(maxAllowedOut, math.min(CONFIG.outputHeatCapMax, demandCap))
   end
 
   maxAllowedOut = clamp(maxAllowedOut, 0, CONFIG.maxOutput)
@@ -1252,8 +1266,13 @@ local function applyRunControl(info, dt)
 
   local biasTarget = (gen * biasBaseFactor) + outSatTrim + outTempTrim
 
+  if fField > recoverExit and fSat > CONFIG.targetSaturation + 5 then
+    local demandFloor = (satSurplus * CONFIG.outputDemandPerSatPct) + (tempDeficit * CONFIG.outputDemandPerTempC)
+    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, demandFloor))
+  end
+
   if state.justRecovered then
-    biasTarget = math.max(biasTarget, gen * 0.28)
+    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, math.max(gen * 0.28, 1200000)))
   end
 
   if fField < fieldSoftBand then
