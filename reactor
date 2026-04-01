@@ -20,16 +20,16 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "7.0",
+  version      = "8.0",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
   -- USER TARGETS
   ----------------------------------------------------------
   targetTemp        = 7600,
-  targetField       = 45,
-  targetSaturation  = 46,
-  targetGain        = 115,
+  targetField       = 50,
+  targetSaturation  = 50,
+  targetGain        = 80,
 
   ----------------------------------------------------------
   -- READY THRESHOLDS
@@ -52,14 +52,14 @@ local CONFIG = {
   bleedInputFloor         = 8000000,
   bleedInputMultiplier    = 1.30,
   bleedOutputStart        = 250000,
-  bleedOutputRampUp       = 500000,
-  bleedOutputMax          = 30000000,
+  bleedOutputRampUp       = 350000,
+  bleedOutputMax          = 22000000,
   bleedMinSeconds         = 2.0,
   bleedTimeoutSeconds     = 35.0,
 
   startupExitGeneration   = 1000000,
-  startupExitField        = 42,
-  startupRecoverField     = 50,
+  startupExitField        = 45,
+  startupRecoverField     = 52,
   startupRecoverSat       = 82,
 
   ----------------------------------------------------------
@@ -84,27 +84,31 @@ local CONFIG = {
   ----------------------------------------------------------
   -- LOOP TIMING
   ----------------------------------------------------------
-  controlRate = 0.10,
-  uiRate      = 0.20,
+  controlRate = 0.20,
+  uiRate      = 0.25,
 
   ----------------------------------------------------------
   -- FILTERING / CONTROL SHAPE
   ----------------------------------------------------------
-  filterAlphaField = 0.20,
-  filterAlphaSat   = 0.20,
-  filterAlphaTemp  = 0.15,
+  filterAlphaField = 0.08,
+  filterAlphaSat   = 0.08,
+  filterAlphaTemp  = 0.06,
 
-  inputRampUp      = 12000000,
-  inputRampDown    = 2000000,
-  outputRampUp     = 150000,
-  outputRampDown   = 1500000,
+  inputRampUp      = 4000000,
+  inputRampDown    = 500000,
+  outputRampUp     = 50000,
+  outputRampDown   = 2500000,
 
-  inputBaseFloorFactor = 1.08,
+  inputBaseFloorFactor = 1.15,
 
-  -- Field protection bands
-  fieldRecoverOffset      = 3,  -- enter recovery if filtered field < target + this
-  fieldRecoverExitOffset  = 8,  -- leave recovery if filtered field > target + this
-  fieldSoftOffset         = 6,  -- softer output cap below this band
+  -- Field protection and recovery
+  fieldRecoverEnter     = 58,  -- filtered field below this enters recovery
+  fieldRecoverExit      = 66,  -- must exceed this to leave recovery
+  fieldSoftBand         = 62,  -- output capped harder below this
+  fieldHardBand         = 55,  -- output forced to 0 below this
+  fieldDropTrip         = 6.0, -- if filtered field drops this much in one control step, recovery
+  satLowBand            = 42,
+  satSoftBand           = 48,
 
   ----------------------------------------------------------
   -- FLOW LIMITS
@@ -113,14 +117,23 @@ local CONFIG = {
   maxOutput = 2147483000,
 
   ----------------------------------------------------------
+  -- OUTPUT BIAS CONTROL
+  ----------------------------------------------------------
+  outputBiasStepUpBase       = 35000,
+  outputBiasStepDownBase     = 180000,
+  outputBiasStepDownFast     = 700000,
+  outputBiasMaxFactorBase    = 0.55,  -- max output as fraction of generation before gain multiplier
+  outputBiasHeatPushFactor   = 0.85,  -- when reactor is cool but safe, allow more output push
+
+  ----------------------------------------------------------
   -- PID TUNING
   ----------------------------------------------------------
   pid = {
-    inputField = { kp = 11000, ki = 650,  kd = 2200, min = -4000000, max = 7000000 },
-    inputTemp  = { kp = 120,   ki = 10,   kd = 250,  min = -2000000, max = 1000000 },
+    inputField = { kp = 8000,  ki = 400, kd = 1200, min = -2500000, max = 4500000 },
+    inputTemp  = { kp = 70,    ki = 6,   kd = 120,  min = -1000000, max = 700000 },
 
-    outputSat  = { kp = 18000, ki = 700,  kd = 2800, min = -3000000, max = 3000000 },
-    outputTemp = { kp = 2200,  ki = 80,   kd = 500,  min = -2000000, max = 2000000 },
+    outputSat  = { kp = 6000,  ki = 180, kd = 900,  min = -1200000, max = 1200000 },
+    outputTemp = { kp = 700,   ki = 30,  kd = 120,  min = -800000,  max = 800000 },
   }
 }
 
@@ -165,8 +178,10 @@ local state = {
   filtField = nil,
   filtSat   = nil,
   filtTemp  = nil,
+  prevFiltField = nil,
 
   fieldRecovery = false,
+  outputBias = 0,
 }
 
 --========================================================--
@@ -226,7 +241,7 @@ local function slew(current, target, upRate, downRate)
 end
 
 local function gainScale()
-  return clamp((CONFIG.targetGain or 100) / 100, 0.25, 3.0)
+  return clamp((CONFIG.targetGain or 100) / 100, 0.25, 2.0)
 end
 
 local function lerp(old, newVal, alpha)
@@ -470,6 +485,7 @@ local function updateFiltered(info)
   local rawSat   = saturationPct(info)
   local rawTemp  = info.temperature or 0
 
+  state.prevFiltField = state.filtField
   state.filtField = lerp(state.filtField, rawField, CONFIG.filterAlphaField)
   state.filtSat   = lerp(state.filtSat, rawSat, CONFIG.filterAlphaSat)
   state.filtTemp  = lerp(state.filtTemp, rawTemp, CONFIG.filterAlphaTemp)
@@ -673,8 +689,8 @@ local function drawTuneStatic()
   writeAt(math.max(2, monW - 8), 1, "TUNE", colors.lightGray, colors.black)
 
   writeAt(3, 3, "Live tuning page", colors.white, colors.black)
-  writeAt(3, 4, "Targets update immediately while running.", colors.lightGray, colors.black)
-  writeAt(3, 5, "Gain = output aggressiveness.", colors.lightGray, colors.black)
+  writeAt(3, 4, "Lower gain = smoother / safer output.", colors.lightGray, colors.black)
+  writeAt(3, 5, "Higher sat = cooler, lower sat = hotter.", colors.lightGray, colors.black)
 
   addButton("back", 2, 28, 13, 30, "Back", colors.cyan, colors.black, function()
     uiPage = "main"
@@ -705,10 +721,10 @@ local function drawTuneStatic()
   })
 
   addTuneRow(12, "Target Field", fmtPct(CONFIG.targetField), {
-    { id="tf_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetField", -5, 35, 70) end },
-    { id="tf_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetField", -1, 35, 70) end },
-    { id="tf_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetField", 1, 35, 70) end },
-    { id="tf_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetField", 5, 35, 70) end },
+    { id="tf_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetField", -5, 45, 75) end },
+    { id="tf_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetField", -1, 45, 75) end },
+    { id="tf_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetField", 1, 45, 75) end },
+    { id="tf_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetField", 5, 45, 75) end },
   })
 
   addTuneRow(16, "Target Sat", fmtPct(CONFIG.targetSaturation), {
@@ -719,10 +735,10 @@ local function drawTuneStatic()
   })
 
   addTuneRow(20, "Gain", tostring(CONFIG.targetGain) .. "%", {
-    { id="tg_m10", label="-10", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetGain", -10, 25, 300) end },
-    { id="tg_m1",  label="-1",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetGain", -1, 25, 300) end },
-    { id="tg_p1",  label="+1",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetGain", 1, 25, 300) end },
-    { id="tg_p10", label="+10", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetGain", 10, 25, 300) end },
+    { id="tg_m10", label="-10", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetGain", -10, 25, 200) end },
+    { id="tg_m1",  label="-1",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetGain", -1, 25, 200) end },
+    { id="tg_p1",  label="+1",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetGain", 1, 25, 200) end },
+    { id="tg_p10", label="+10", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetGain", 10, 25, 200) end },
   })
 
   for _, b in pairs(buttons) do
@@ -788,10 +804,11 @@ local function scram(reason)
   state.bleedSince = nil
   state.primeUntil = nil
   state.fieldRecovery = false
+  state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
   gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.startupHoldInputFloor, 1.20)
+  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 55), CONFIG.startupHoldInputFloor, 1.20)
   state.lastOutput = 0
 
   setStatus("SCRAM: " .. tostring(state.scramReason), colors.red)
@@ -805,10 +822,11 @@ local function safeShutdown(reason)
   state.bleedSince = nil
   state.primeUntil = nil
   state.fieldRecovery = false
+  state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
   gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 50), CONFIG.cooldownInputFloor, 1.08)
+  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 55), CONFIG.cooldownInputFloor, 1.08)
   state.lastOutput = 0
   state.mode = "stopping"
 
@@ -824,12 +842,13 @@ local function processOperatorRequests(info)
     state.bleedSince = nil
     state.primeUntil = nil
     state.fieldRecovery = false
+    state.outputBias = 0
     state.mode = "charging"
     resetPIDs()
 
     pcall(function() reactor.chargeReactor() end)
     gateSet(gateOut, 0)
-    holdInputSafe(info, 55, CONFIG.minChargeRate, 1.25)
+    holdInputSafe(info, 60, CONFIG.minChargeRate, 1.25)
     state.lastOutput = 0
     uiDirty = true
     setStatus("Charging reactor", colors.yellow)
@@ -850,7 +869,7 @@ local function processOperatorRequests(info)
     end
 
     gateSet(gateOut, 0)
-    holdInputSafe(info, 55, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
+    holdInputSafe(info, 60, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
     state.lastOutput = 0
     state.mode = "priming"
     state.primeUntil = os.clock() + CONFIG.activatePrimeSeconds
@@ -911,7 +930,7 @@ end
 
 local function applyChargingControl(info)
   gateSet(gateOut, 0)
-  holdInputSafe(info, 55, CONFIG.minChargeRate, 1.25)
+  holdInputSafe(info, 60, CONFIG.minChargeRate, 1.25)
   state.lastOutput = 0
 
   if chargeReady(info) then
@@ -928,7 +947,7 @@ end
 
 local function applyCoolingControl(info)
   gateSet(gateOut, 0)
-  holdInputSafe(info, math.max(CONFIG.targetField, 50), CONFIG.cooldownInputFloor, 1.05)
+  holdInputSafe(info, math.max(CONFIG.targetField, 55), CONFIG.cooldownInputFloor, 1.05)
   state.lastOutput = 0
 
   if state.safeStopLatch then
@@ -942,7 +961,7 @@ local function computeRunInput(info, dt, holdFieldTarget)
   local fField = state.filtField or fieldPct(info)
   local fTemp  = state.filtTemp or (info.temperature or 0)
 
-  holdFieldTarget = holdFieldTarget or (CONFIG.targetField + 5)
+  holdFieldTarget = holdFieldTarget or (CONFIG.targetField + 10)
 
   local baseIn = computeBaseInput(info, holdFieldTarget)
   local minSafeIn = baseIn * CONFIG.inputBaseFloorFactor
@@ -960,7 +979,7 @@ end
 
 local function applyPrimingControl(info)
   gateSet(gateOut, 0)
-  holdInputSafe(info, 55, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
+  holdInputSafe(info, 60, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
   state.lastOutput = 0
 
   if os.clock() >= (state.primeUntil or 0) then
@@ -969,6 +988,7 @@ local function applyPrimingControl(info)
     state.startupSince = os.clock()
     state.bleedSince = nil
     state.fieldRecovery = false
+    state.outputBias = 0
     state.mode = "startup_hold"
     uiDirty = true
     setStatus("Activated - startup hold", colors.lime)
@@ -986,7 +1006,7 @@ local function applyStartupHoldControl(info)
   gateSet(gateOut, 0)
   state.lastOutput = 0
 
-  local base = computeBaseInput(info, 55)
+  local base = computeBaseInput(info, 60)
   local wantIn = math.max(base * CONFIG.startupHoldMultiplier, CONFIG.startupHoldInputFloor)
 
   if fp < CONFIG.startupRecoverField or sp < CONFIG.startupRecoverSat then
@@ -1024,7 +1044,7 @@ local function applyStartupBleedControl(info)
   local elapsed = os.clock() - (state.bleedSince or os.clock())
   local gScale = gainScale()
 
-  local bleedFieldTarget = math.max(CONFIG.targetField + 8, 52)
+  local bleedFieldTarget = math.max(CONFIG.targetField + 10, 60)
   local baseIn = computeBaseInput(info, bleedFieldTarget)
   local wantIn = math.max(baseIn * CONFIG.bleedInputMultiplier, CONFIG.bleedInputFloor)
 
@@ -1048,7 +1068,7 @@ local function applyStartupBleedControl(info)
     rampFactor = 2
   end
 
-  local bleedCap = math.max(CONFIG.bleedOutputMax, gen * (1.0 + gScale))
+  local bleedCap = math.max(CONFIG.bleedOutputMax, gen * (0.9 + 0.4 * gScale))
   bleedCap = clamp(bleedCap, CONFIG.bleedOutputStart, CONFIG.maxOutput)
 
   local bleedTarget = state.lastOutput + (CONFIG.bleedOutputRampUp * rampFactor)
@@ -1070,13 +1090,14 @@ local function applyStartupBleedControl(info)
   local timeoutFallback =
     elapsed >= CONFIG.bleedTimeoutSeconds
     and gen > 0
-    and fp >= 40
+    and fp >= 45
     and isRunningStatus(info.status)
 
   if readyForRun or timeoutFallback then
     state.mode = "run"
     resetPIDs()
     state.fieldRecovery = false
+    state.outputBias = math.min(state.lastOutput, gen * 0.35)
     uiDirty = true
     setStatus("Startup complete - run mode", colors.lime)
     return
@@ -1098,24 +1119,27 @@ local function applyRunControl(info, dt)
   local fField = state.filtField or rawField
   local fSat = state.filtSat or rawSat
   local fTemp = state.filtTemp or rawTemp
+  local prevField = state.prevFiltField or fField
   local fup = fuelPct(info)
   local gen = info.generationRate or 0
   local gScale = gainScale()
 
-  local recoverEnter = CONFIG.targetField + CONFIG.fieldRecoverOffset
-  local recoverExit  = CONFIG.targetField + CONFIG.fieldRecoverExitOffset
-  local softBand     = CONFIG.targetField + CONFIG.fieldSoftOffset
+  local fieldDelta = fField - prevField
 
-  if fField < recoverEnter then
+  if fieldDelta <= -CONFIG.fieldDropTrip then
     state.fieldRecovery = true
-  elseif state.fieldRecovery and fField > recoverExit and rawField > recoverExit then
+  end
+
+  if fField < CONFIG.fieldRecoverEnter then
+    state.fieldRecovery = true
+  elseif state.fieldRecovery and fField > CONFIG.fieldRecoverExit and rawField > CONFIG.fieldRecoverExit then
     state.fieldRecovery = false
   end
 
   if state.fieldRecovery then
-    local holdFieldTarget = CONFIG.targetField + 10
+    local holdFieldTarget = CONFIG.targetField + 14
     local baseIn = computeBaseInput(info, holdFieldTarget)
-    local wantIn = math.max(baseIn * 1.35, CONFIG.bleedInputFloor, baseIn + 5000000)
+    local wantIn = math.max(baseIn * 1.35, CONFIG.bleedInputFloor, baseIn + 6000000)
     wantIn = slew(state.lastInput, clamp(wantIn, 0, CONFIG.maxInput), CONFIG.inputRampUp, CONFIG.inputRampDown)
 
     gateSet(gateIn, wantIn)
@@ -1123,61 +1147,82 @@ local function applyRunControl(info, dt)
 
     state.lastInput = wantIn
     state.lastOutput = 0
+    state.outputBias = 0
     state.mode = "recover"
     setStatus(
-      ("Field recovery F:%.1f%% raw:%.1f%% In:%s"):format(fField, rawField, fmtInt(wantIn)),
+      ("Field recovery F:%.1f raw:%.1f dF:%.1f In:%s"):format(fField, rawField, fieldDelta, fmtInt(wantIn)),
       colors.orange
     )
     return
   end
 
-  local holdFieldTarget = CONFIG.targetField + 5
+  local holdFieldTarget = CONFIG.targetField + 10
   local wantIn, baseIn = computeRunInput(info, dt, holdFieldTarget)
 
-  local satSurplus = fSat - CONFIG.targetSaturation
-  local tempDeficit = CONFIG.targetTemp - fTemp
+  local satError = fSat - CONFIG.targetSaturation
+  local tempError = CONFIG.targetTemp - fTemp
 
-  local outSatTrim  = pidUpdate(pidOutSat, satSurplus, dt)
-  local outTempTrim = pidUpdate(pidOutTemp, tempDeficit, dt)
+  local outSatTrim  = pidUpdate(pidOutSat, satError, dt)
+  local outTempTrim = pidUpdate(pidOutTemp, tempError, dt)
 
-  local rawOutTarget = state.lastOutput + ((outSatTrim + outTempTrim) * gScale)
+  local biasUp   = CONFIG.outputBiasStepUpBase * gScale
+  local biasDown = CONFIG.outputBiasStepDownBase
+  local biasDownFast = CONFIG.outputBiasStepDownFast
 
-  local dynamicOutMax = gen * (0.70 + 0.40 * gScale)
-  dynamicOutMax = math.max(dynamicOutMax, 25000)
+  local outputFactorMax = CONFIG.outputBiasMaxFactorBase + ((gScale - 1.0) * 0.20)
+  outputFactorMax = clamp(outputFactorMax, 0.20, 0.90)
+  local maxAllowedOut = gen * outputFactorMax
 
-  if fSat > CONFIG.targetSaturation + 20 and fField > CONFIG.targetField + 8 and fTemp < CONFIG.targetTemp - 500 then
-    dynamicOutMax = math.max(dynamicOutMax, gen * (1.60 + 0.40 * gScale))
-    rawOutTarget = math.max(rawOutTarget, gen * (1.15 + 0.25 * gScale))
-  elseif fSat > CONFIG.targetSaturation + 10 and fField > softBand and fTemp < CONFIG.targetTemp - 150 then
-    dynamicOutMax = math.max(dynamicOutMax, gen * (1.20 + 0.25 * gScale))
+  if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > CONFIG.fieldRecoverExit then
+    maxAllowedOut = math.max(maxAllowedOut, gen * CONFIG.outputBiasHeatPushFactor)
   end
 
-  if fField < softBand then
-    dynamicOutMax = math.min(dynamicOutMax, gen * 0.35)
+  maxAllowedOut = clamp(maxAllowedOut, 0, CONFIG.maxOutput)
+
+  local biasTarget = state.outputBias + outSatTrim + outTempTrim
+
+  if fField < CONFIG.fieldSoftBand then
+    biasTarget = math.min(biasTarget, gen * 0.20)
   end
 
-  if fSat < CONFIG.targetSaturation - 4 then
-    rawOutTarget = math.min(rawOutTarget, gen * 0.35)
-  end
-
-  if fTemp > CONFIG.targetTemp - 50 then
-    rawOutTarget = math.min(rawOutTarget, gen * 0.30)
-  end
-
-  if fField < CONFIG.targetField + 4 then
-    rawOutTarget = math.min(rawOutTarget, gen * 0.20)
+  if fField < CONFIG.fieldHardBand or fSat < CONFIG.satLowBand then
+    biasTarget = 0
+    wantIn = math.max(wantIn, baseIn * 1.35)
+  elseif fField < CONFIG.fieldSoftBand or fSat < CONFIG.satSoftBand then
+    biasTarget = math.min(biasTarget, gen * 0.15)
     wantIn = math.max(wantIn, baseIn * 1.20)
   end
 
-  if fField < CONFIG.targetField + 2 or fSat < CONFIG.targetSaturation - 8 then
-    rawOutTarget = 0
+  if fieldDelta < -2.0 then
+    biasTarget = 0
     wantIn = math.max(wantIn, baseIn * 1.30)
+  elseif fieldDelta < -1.0 then
+    biasTarget = math.min(biasTarget, gen * 0.10)
+    wantIn = math.max(wantIn, baseIn * 1.20)
   end
 
-  dynamicOutMax = clamp(dynamicOutMax, 0, CONFIG.maxOutput)
-  rawOutTarget = clamp(rawOutTarget, 0, dynamicOutMax)
+  if fTemp > CONFIG.targetTemp - 50 then
+    biasTarget = math.min(biasTarget, gen * 0.20)
+  end
 
-  local wantOut = slew(state.lastOutput, rawOutTarget, CONFIG.outputRampUp, CONFIG.outputRampDown)
+  if fSat > CONFIG.targetSaturation + 18 and fField > CONFIG.fieldRecoverExit and fTemp < CONFIG.targetTemp - 300 then
+    biasTarget = math.max(biasTarget, gen * (0.45 + 0.15 * gScale))
+  elseif fSat > CONFIG.targetSaturation + 10 and fField > CONFIG.fieldSoftBand and fTemp < CONFIG.targetTemp - 100 then
+    biasTarget = math.max(biasTarget, gen * (0.30 + 0.10 * gScale))
+  end
+
+  biasTarget = clamp(biasTarget, 0, maxAllowedOut)
+
+  local biasStepUp = biasUp
+  local biasStepDownNow = biasDown
+
+  if fieldDelta < -1.0 or fField < CONFIG.fieldSoftBand or fSat < CONFIG.satSoftBand then
+    biasStepDownNow = biasDownFast
+  end
+
+  state.outputBias = slew(state.outputBias, biasTarget, biasStepUp, biasStepDownNow)
+
+  local wantOut = slew(state.lastOutput, state.outputBias, CONFIG.outputRampUp, CONFIG.outputRampDown)
 
   gateSet(gateIn, clamp(wantIn, 0, CONFIG.maxInput))
   gateSet(gateOut, clamp(wantOut, 0, CONFIG.maxOutput))
@@ -1190,8 +1235,8 @@ local function applyRunControl(info, dt)
   state.scramReason = nil
 
   setStatus(
-    ("Run | T:%d F:%.1f/%.1f S:%.1f/%.1f Fuel:%.1f%% Out:%s"):format(
-      rawTemp, rawField, fField, rawSat, fSat, fup, fmtInt(wantOut)
+    ("Run | T:%d F:%.1f/%.1f dF:%.1f S:%.1f/%.1f Fuel:%.1f%% Out:%s"):format(
+      rawTemp, rawField, fField, fieldDelta, rawSat, fSat, fup, fmtInt(wantOut)
     ),
     colors.lime
   )
@@ -1235,9 +1280,11 @@ local function applyControl(info, dt)
     state.bleedSince = nil
     state.primeUntil = nil
     state.fieldRecovery = false
+    state.outputBias = 0
     state.filtField = nil
     state.filtSat = nil
     state.filtTemp = nil
+    state.prevFiltField = nil
     state.mode = "idle"
     uiDirty = true
 
@@ -1258,6 +1305,7 @@ local function applyControl(info, dt)
     state.readyToActivate = false
     state.mode = (status == "stopping") and "stopping" or "cooling"
     state.fieldRecovery = false
+    state.outputBias = 0
     uiDirty = true
     applyCoolingControl(info)
     return
@@ -1286,6 +1334,7 @@ local function applyControl(info, dt)
   state.readyToActivate = false
   state.mode = "idle"
   state.fieldRecovery = false
+  state.outputBias = 0
   uiDirty = true
   setStatus("Unhandled status: " .. tostring(status), colors.orange)
 end
@@ -1333,6 +1382,7 @@ local function uiLoop()
       tostring(CONFIG.targetSaturation),
       tostring(CONFIG.targetGain),
       tostring(state.fieldRecovery),
+      tostring(math.floor(state.outputBias or 0)),
       info and tostring(math.floor(info.temperature or 0)) or "nil",
       info and tostring(math.floor((info.generationRate or 0) / 1000)) or "nil",
       info and tostring(math.floor((fieldPct(info) or 0) * 10)) or "nil",
