@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "8.1",
+  version      = "8.2",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -96,7 +96,7 @@ local CONFIG = {
 
   inputRampUp      = 4000000,
   inputRampDown    = 500000,
-  outputRampUp     = 50000,
+  outputRampUp     = 150000,
   outputRampDown   = 2500000,
 
   inputBaseFloorFactor = 1.15,
@@ -120,10 +120,10 @@ local CONFIG = {
   ----------------------------------------------------------
   -- OUTPUT BIAS CONTROL
   ----------------------------------------------------------
-  outputBiasStepUpBase       = 45000,
+  outputBiasStepUpBase       = 140000,
   outputBiasStepDownBase     = 140000,
   outputBiasStepDownFast     = 450000,
-  outputBiasMaxFactorBase    = 0.68,  -- max output as fraction of generation before gain multiplier
+  outputBiasMaxFactorBase    = 0.72,  -- max output as fraction of generation before gain multiplier
   outputBiasHeatPushFactor   = 0.92,  -- when reactor is cool but safe, allow more output push
 
   ----------------------------------------------------------
@@ -183,6 +183,7 @@ local state = {
 
   fieldRecovery = false,
   fieldDipCount = 0,
+  justRecovered = false,
   outputBias = 0,
   redrawQueued = false,
 }
@@ -835,6 +836,7 @@ local function scram(reason)
   state.primeUntil = nil
   state.fieldRecovery = false
   state.fieldDipCount = 0
+  state.justRecovered = false
   state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
@@ -854,6 +856,7 @@ local function safeShutdown(reason)
   state.primeUntil = nil
   state.fieldRecovery = false
   state.fieldDipCount = 0
+  state.justRecovered = false
   state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
@@ -875,6 +878,7 @@ local function processOperatorRequests(info)
     state.primeUntil = nil
     state.fieldRecovery = false
     state.fieldDipCount = 0
+    state.justRecovered = false
     state.outputBias = 0
     state.mode = "charging"
     resetPIDs()
@@ -1022,6 +1026,7 @@ local function applyPrimingControl(info)
     state.bleedSince = nil
     state.fieldRecovery = false
     state.fieldDipCount = 0
+    state.justRecovered = false
     state.outputBias = 0
     state.mode = "startup_hold"
     uiDirty = true
@@ -1180,6 +1185,7 @@ local function applyRunControl(info, dt)
   elseif state.fieldRecovery and fField > recoverExit and rawField > math.max(recoverExit - 1, CONFIG.targetField + 3) and fieldDelta >= -1.0 then
     state.fieldRecovery = false
     state.fieldDipCount = 0
+    state.justRecovered = true
   end
 
   local holdFieldTarget = CONFIG.targetField + 8
@@ -1233,7 +1239,22 @@ local function applyRunControl(info, dt)
 
   maxAllowedOut = clamp(maxAllowedOut, 0, CONFIG.maxOutput)
 
-  local biasTarget = state.outputBias + outSatTrim + outTempTrim
+  local safeFieldHeadroom = math.max(0, fField - CONFIG.targetField)
+  local biasBaseFactor = 0.18
+
+  if safeFieldHeadroom >= 10 and fSat >= CONFIG.targetSaturation + 15 then
+    biasBaseFactor = 0.34
+  elseif safeFieldHeadroom >= 6 and fSat >= CONFIG.targetSaturation + 8 then
+    biasBaseFactor = 0.26
+  elseif safeFieldHeadroom >= 3 then
+    biasBaseFactor = 0.20
+  end
+
+  local biasTarget = (gen * biasBaseFactor) + outSatTrim + outTempTrim
+
+  if state.justRecovered then
+    biasTarget = math.max(biasTarget, gen * 0.28)
+  end
 
   if fField < fieldSoftBand then
     biasTarget = math.min(biasTarget, gen * 0.35)
@@ -1270,11 +1291,16 @@ local function applyRunControl(info, dt)
   local biasStepUp = biasUp
   local biasStepDownNow = biasDown
 
+  if state.justRecovered then
+    biasStepUp = math.max(biasStepUp, CONFIG.outputRampUp * 2)
+  end
+
   if fieldDelta < -1.0 or fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
     biasStepDownNow = biasDownFast
   end
 
   state.outputBias = slew(state.outputBias, biasTarget, biasStepUp, biasStepDownNow)
+  state.justRecovered = false
 
   local wantOut = slew(state.lastOutput, state.outputBias, CONFIG.outputRampUp, CONFIG.outputRampDown)
 
@@ -1336,6 +1362,7 @@ local function applyControl(info, dt)
     state.primeUntil = nil
     state.fieldRecovery = false
     state.fieldDipCount = 0
+    state.justRecovered = false
     state.outputBias = 0
     state.filtField = nil
     state.filtSat = nil
@@ -1362,6 +1389,7 @@ local function applyControl(info, dt)
     state.mode = (status == "stopping") and "stopping" or "cooling"
     state.fieldRecovery = false
     state.fieldDipCount = 0
+    state.justRecovered = false
     state.outputBias = 0
     uiDirty = true
     applyCoolingControl(info)
@@ -1391,6 +1419,7 @@ local function applyControl(info, dt)
   state.readyToActivate = false
   state.mode = "idle"
   state.fieldRecovery = false
+  state.justRecovered = false
   state.outputBias = 0
   uiDirty = true
   setStatus("Unhandled status: " .. tostring(status), colors.orange)
