@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "8.0",
+  version      = "8.1",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -102,13 +102,14 @@ local CONFIG = {
   inputBaseFloorFactor = 1.15,
 
   -- Field protection and recovery
-  fieldRecoverEnter     = 58,  -- filtered field below this enters recovery
-  fieldRecoverExit      = 66,  -- must exceed this to leave recovery
-  fieldSoftBand         = 62,  -- output capped harder below this
-  fieldHardBand         = 55,  -- output forced to 0 below this
-  fieldDropTrip         = 6.0, -- if filtered field drops this much in one control step, recovery
-  satLowBand            = 42,
-  satSoftBand           = 48,
+  fieldRecoverMarginEnter = 2,   -- enter recovery when filtered field drops this far below target
+  fieldRecoverMarginExit  = 6,   -- leave recovery after climbing this far above target
+  fieldSoftMargin         = 4,   -- start soft output limiting near target instead of far above it
+  fieldHardMargin         = -1,  -- hard clamp only when field actually falls below target
+  fieldDropTrip           = 8.0, -- require a larger filtered drop before tripping recovery
+  fieldTripSamples        = 3,   -- consecutive shaky samples before full recovery mode
+  satLowBand              = 42,
+  satSoftBand             = 48,
 
   ----------------------------------------------------------
   -- FLOW LIMITS
@@ -119,11 +120,11 @@ local CONFIG = {
   ----------------------------------------------------------
   -- OUTPUT BIAS CONTROL
   ----------------------------------------------------------
-  outputBiasStepUpBase       = 35000,
-  outputBiasStepDownBase     = 180000,
-  outputBiasStepDownFast     = 700000,
-  outputBiasMaxFactorBase    = 0.55,  -- max output as fraction of generation before gain multiplier
-  outputBiasHeatPushFactor   = 0.85,  -- when reactor is cool but safe, allow more output push
+  outputBiasStepUpBase       = 45000,
+  outputBiasStepDownBase     = 140000,
+  outputBiasStepDownFast     = 450000,
+  outputBiasMaxFactorBase    = 0.68,  -- max output as fraction of generation before gain multiplier
+  outputBiasHeatPushFactor   = 0.92,  -- when reactor is cool but safe, allow more output push
 
   ----------------------------------------------------------
   -- PID TUNING
@@ -181,7 +182,9 @@ local state = {
   prevFiltField = nil,
 
   fieldRecovery = false,
+  fieldDipCount = 0,
   outputBias = 0,
+  redrawQueued = false,
 }
 
 --========================================================--
@@ -491,6 +494,28 @@ local function updateFiltered(info)
   state.filtTemp  = lerp(state.filtTemp, rawTemp, CONFIG.filterAlphaTemp)
 end
 
+local function fieldRecoverEnterThreshold()
+  return clamp(CONFIG.targetField + CONFIG.fieldRecoverMarginEnter, 25, 90)
+end
+
+local function fieldRecoverExitThreshold()
+  return clamp(CONFIG.targetField + CONFIG.fieldRecoverMarginExit, 30, 95)
+end
+
+local function fieldSoftThreshold()
+  return clamp(CONFIG.targetField + CONFIG.fieldSoftMargin, 20, 95)
+end
+
+local function fieldHardThreshold()
+  return clamp(CONFIG.targetField + CONFIG.fieldHardMargin, 10, 90)
+end
+
+local function requestFullRedraw()
+  lastStaticPage = nil
+  uiDirty = true
+  state.redrawQueued = true
+end
+
 --========================================================--
 -- LOW-FLICKER UI
 --========================================================--
@@ -781,8 +806,13 @@ local function handleTouch(side, x, y)
   if side ~= monName then return end
   for _, b in pairs(buttons) do
     if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
+      local oldPage = uiPage
       if b.fn then b.fn() end
-      redraw(uiPage ~= lastStaticPage)
+      if uiPage ~= oldPage then
+        requestFullRedraw()
+      else
+        uiDirty = true
+      end
       return
     end
   end
@@ -804,6 +834,7 @@ local function scram(reason)
   state.bleedSince = nil
   state.primeUntil = nil
   state.fieldRecovery = false
+  state.fieldDipCount = 0
   state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
@@ -822,6 +853,7 @@ local function safeShutdown(reason)
   state.bleedSince = nil
   state.primeUntil = nil
   state.fieldRecovery = false
+  state.fieldDipCount = 0
   state.outputBias = 0
 
   pcall(function() reactor.stopReactor() end)
@@ -842,6 +874,7 @@ local function processOperatorRequests(info)
     state.bleedSince = nil
     state.primeUntil = nil
     state.fieldRecovery = false
+    state.fieldDipCount = 0
     state.outputBias = 0
     state.mode = "charging"
     resetPIDs()
@@ -988,6 +1021,7 @@ local function applyPrimingControl(info)
     state.startupSince = os.clock()
     state.bleedSince = nil
     state.fieldRecovery = false
+    state.fieldDipCount = 0
     state.outputBias = 0
     state.mode = "startup_hold"
     uiDirty = true
@@ -1125,39 +1159,59 @@ local function applyRunControl(info, dt)
   local gScale = gainScale()
 
   local fieldDelta = fField - prevField
+  local recoverEnter = fieldRecoverEnterThreshold()
+  local recoverExit = fieldRecoverExitThreshold()
+  local fieldSoftBand = fieldSoftThreshold()
+  local fieldHardBand = fieldHardThreshold()
 
-  if fieldDelta <= -CONFIG.fieldDropTrip then
-    state.fieldRecovery = true
+  local severeFieldDip = (fField < fieldHardBand) or (fieldDelta <= -CONFIG.fieldDropTrip)
+  local shakyField = (fField < recoverEnter) or (fieldDelta <= -(CONFIG.fieldDropTrip * 0.55))
+
+  if severeFieldDip then
+    state.fieldDipCount = CONFIG.fieldTripSamples
+  elseif shakyField then
+    state.fieldDipCount = math.min((state.fieldDipCount or 0) + 1, CONFIG.fieldTripSamples)
+  else
+    state.fieldDipCount = math.max((state.fieldDipCount or 0) - 1, 0)
   end
 
-  if fField < CONFIG.fieldRecoverEnter then
+  if severeFieldDip or (state.fieldDipCount or 0) >= CONFIG.fieldTripSamples then
     state.fieldRecovery = true
-  elseif state.fieldRecovery and fField > CONFIG.fieldRecoverExit and rawField > CONFIG.fieldRecoverExit then
+  elseif state.fieldRecovery and fField > recoverExit and rawField > math.max(recoverExit - 1, CONFIG.targetField + 3) and fieldDelta >= -1.0 then
     state.fieldRecovery = false
+    state.fieldDipCount = 0
   end
+
+  local holdFieldTarget = CONFIG.targetField + 8
+  local wantIn, baseIn = computeRunInput(info, dt, holdFieldTarget)
 
   if state.fieldRecovery then
-    local holdFieldTarget = CONFIG.targetField + 14
-    local baseIn = computeBaseInput(info, holdFieldTarget)
-    local wantIn = math.max(baseIn * 1.35, CONFIG.bleedInputFloor, baseIn + 6000000)
+    local recoverTarget = CONFIG.targetField + 10
+    baseIn = computeBaseInput(info, recoverTarget)
+    wantIn = math.max(baseIn * 1.22, CONFIG.bleedInputFloor, baseIn + 3000000)
     wantIn = slew(state.lastInput, clamp(wantIn, 0, CONFIG.maxInput), CONFIG.inputRampUp, CONFIG.inputRampDown)
 
+    local keepOut = math.min(state.lastOutput * 0.35, gen * 0.08)
+    if severeFieldDip or fField < fieldHardBand or fSat < CONFIG.satLowBand then
+      keepOut = 0
+    end
+    local wantOut = slew(state.lastOutput, clamp(keepOut, 0, CONFIG.maxOutput), CONFIG.outputRampUp, CONFIG.outputRampDown)
+
     gateSet(gateIn, wantIn)
-    gateSet(gateOut, 0)
+    gateSet(gateOut, wantOut)
 
     state.lastInput = wantIn
-    state.lastOutput = 0
-    state.outputBias = 0
+    state.lastOutput = wantOut
+    state.outputBias = wantOut
     state.mode = "recover"
     setStatus(
-      ("Field recovery F:%.1f raw:%.1f dF:%.1f In:%s"):format(fField, rawField, fieldDelta, fmtInt(wantIn)),
+      ("Field recovery F:%.1f raw:%.1f dF:%.1f dips:%d In:%s Out:%s"):format(
+        fField, rawField, fieldDelta, state.fieldDipCount or 0, fmtInt(wantIn), fmtInt(wantOut)
+      ),
       colors.orange
     )
     return
   end
-
-  local holdFieldTarget = CONFIG.targetField + 10
-  local wantIn, baseIn = computeRunInput(info, dt, holdFieldTarget)
 
   local satError = fSat - CONFIG.targetSaturation
   local tempError = CONFIG.targetTemp - fTemp
@@ -1169,11 +1223,11 @@ local function applyRunControl(info, dt)
   local biasDown = CONFIG.outputBiasStepDownBase
   local biasDownFast = CONFIG.outputBiasStepDownFast
 
-  local outputFactorMax = CONFIG.outputBiasMaxFactorBase + ((gScale - 1.0) * 0.20)
-  outputFactorMax = clamp(outputFactorMax, 0.20, 0.90)
+  local outputFactorMax = CONFIG.outputBiasMaxFactorBase + ((gScale - 1.0) * 0.22)
+  outputFactorMax = clamp(outputFactorMax, 0.25, 0.95)
   local maxAllowedOut = gen * outputFactorMax
 
-  if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > CONFIG.fieldRecoverExit then
+  if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > recoverExit then
     maxAllowedOut = math.max(maxAllowedOut, gen * CONFIG.outputBiasHeatPushFactor)
   end
 
@@ -1181,34 +1235,34 @@ local function applyRunControl(info, dt)
 
   local biasTarget = state.outputBias + outSatTrim + outTempTrim
 
-  if fField < CONFIG.fieldSoftBand then
-    biasTarget = math.min(biasTarget, gen * 0.20)
+  if fField < fieldSoftBand then
+    biasTarget = math.min(biasTarget, gen * 0.35)
   end
 
-  if fField < CONFIG.fieldHardBand or fSat < CONFIG.satLowBand then
-    biasTarget = 0
-    wantIn = math.max(wantIn, baseIn * 1.35)
-  elseif fField < CONFIG.fieldSoftBand or fSat < CONFIG.satSoftBand then
-    biasTarget = math.min(biasTarget, gen * 0.15)
-    wantIn = math.max(wantIn, baseIn * 1.20)
+  if fField < fieldHardBand or fSat < CONFIG.satLowBand then
+    biasTarget = math.min(biasTarget, gen * 0.05)
+    wantIn = math.max(wantIn, baseIn * 1.22)
+  elseif fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
+    biasTarget = math.min(biasTarget, gen * 0.25)
+    wantIn = math.max(wantIn, baseIn * 1.12)
   end
 
   if fieldDelta < -2.0 then
-    biasTarget = 0
-    wantIn = math.max(wantIn, baseIn * 1.30)
+    biasTarget = math.min(biasTarget, gen * 0.15)
+    wantIn = math.max(wantIn, baseIn * 1.16)
   elseif fieldDelta < -1.0 then
-    biasTarget = math.min(biasTarget, gen * 0.10)
-    wantIn = math.max(wantIn, baseIn * 1.20)
+    biasTarget = math.min(biasTarget, gen * 0.25)
+    wantIn = math.max(wantIn, baseIn * 1.10)
   end
 
   if fTemp > CONFIG.targetTemp - 50 then
-    biasTarget = math.min(biasTarget, gen * 0.20)
+    biasTarget = math.min(biasTarget, gen * 0.22)
   end
 
-  if fSat > CONFIG.targetSaturation + 18 and fField > CONFIG.fieldRecoverExit and fTemp < CONFIG.targetTemp - 300 then
-    biasTarget = math.max(biasTarget, gen * (0.45 + 0.15 * gScale))
-  elseif fSat > CONFIG.targetSaturation + 10 and fField > CONFIG.fieldSoftBand and fTemp < CONFIG.targetTemp - 100 then
-    biasTarget = math.max(biasTarget, gen * (0.30 + 0.10 * gScale))
+  if fSat > CONFIG.targetSaturation + 18 and fField > recoverExit and fTemp < CONFIG.targetTemp - 300 then
+    biasTarget = math.max(biasTarget, gen * (0.50 + 0.15 * gScale))
+  elseif fSat > CONFIG.targetSaturation + 10 and fField > fieldSoftBand and fTemp < CONFIG.targetTemp - 100 then
+    biasTarget = math.max(biasTarget, gen * (0.36 + 0.10 * gScale))
   end
 
   biasTarget = clamp(biasTarget, 0, maxAllowedOut)
@@ -1216,7 +1270,7 @@ local function applyRunControl(info, dt)
   local biasStepUp = biasUp
   local biasStepDownNow = biasDown
 
-  if fieldDelta < -1.0 or fField < CONFIG.fieldSoftBand or fSat < CONFIG.satSoftBand then
+  if fieldDelta < -1.0 or fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
     biasStepDownNow = biasDownFast
   end
 
@@ -1233,10 +1287,11 @@ local function applyRunControl(info, dt)
   state.safeStopLatch = false
   state.emergencyLatch = false
   state.scramReason = nil
+  state.fieldDipCount = math.max((state.fieldDipCount or 0) - 1, 0)
 
   setStatus(
-    ("Run | T:%d F:%.1f/%.1f dF:%.1f S:%.1f/%.1f Fuel:%.1f%% Out:%s"):format(
-      rawTemp, rawField, fField, fieldDelta, rawSat, fSat, fup, fmtInt(wantOut)
+    ("Run | T:%d F:%.1f/%.1f dF:%.1f dips:%d S:%.1f/%.1f Fuel:%.1f%% Out:%s"):format(
+      rawTemp, rawField, fField, fieldDelta, state.fieldDipCount or 0, rawSat, fSat, fup, fmtInt(wantOut)
     ),
     colors.lime
   )
@@ -1280,6 +1335,7 @@ local function applyControl(info, dt)
     state.bleedSince = nil
     state.primeUntil = nil
     state.fieldRecovery = false
+    state.fieldDipCount = 0
     state.outputBias = 0
     state.filtField = nil
     state.filtSat = nil
@@ -1305,6 +1361,7 @@ local function applyControl(info, dt)
     state.readyToActivate = false
     state.mode = (status == "stopping") and "stopping" or "cooling"
     state.fieldRecovery = false
+    state.fieldDipCount = 0
     state.outputBias = 0
     uiDirty = true
     applyCoolingControl(info)
@@ -1392,10 +1449,11 @@ local function uiLoop()
       tostring(math.floor(gateGet(gateOut) or 0))
     }, "|")
 
-    if uiDirty or snapshot ~= lastSnapshot then
-      redraw(false)
+    if uiDirty or snapshot ~= lastSnapshot or state.redrawQueued then
+      redraw(state.redrawQueued)
       lastSnapshot = snapshot
       uiDirty = false
+      state.redrawQueued = false
     end
 
     sleep(CONFIG.uiRate)
@@ -1411,9 +1469,7 @@ local function eventLoop()
     elseif e[1] == "monitor_resize" then
       pcall(monitor.setTextScale, CONFIG.monitorScale)
       monW, monH = monitor.getSize()
-      lastStaticPage = nil
-      uiDirty = true
-      redraw(true)
+      requestFullRedraw()
     elseif e[1] == "terminate" then
       running = false
       gateSet(gateOut, 0)
