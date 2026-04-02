@@ -1,140 +1,102 @@
---========================================================--
---  ATM10 Draconic Reactor Controller (Simple Target Output)
---  CC:Tweaked
+-- draconic_reactor_controller.lua
+-- CC: Tweaked / ATM10-friendly Draconic Evolution reactor controller
+-- Main features:
+--   * Auto-detects reactor + monitor
+--   * Manual naming for input/output flow gates (saved to config)
+--   * Main UI with Charge / Activate / SCRAM / Tuning
+--   * Separate Auto / Manual mode
+--   * Auto warm-up and output ramp logic
+--   * Anti-lock / watchdog checks for stale peripherals and gate write failures
 --
---  Goal:
---  - You choose a target output rate.
---  - Controller pushes toward that output while keeping:
---      * temperature >= targetTemp (avoid overcooling)
---      * field >= targetField
---      * saturation >= targetSaturation
---  - All targets can be adjusted live in the UI.
+-- INSTALL:
+--   1) Put this file on an Advanced Computer as startup or run it manually.
+--   2) Make sure the reactor peripheral and a monitor are connected.
+--   3) On first launch, enter your input and output flow-gate peripheral names.
+--      Example: flow_gate_0 and flow_gate_1
 --
---  IMPORTANT:
---  - inputGateName  = gate feeding the Energy Injector
---  - outputGateName = gate extracting RF from the Stabilizer side
---========================================================--
+-- NOTES:
+--   * Best reliability is direct peripheral attachment for the two flow gates.
+--   * The script will still work with manually named peripherals if your setup exposes them.
 
-local CONFIG = {
-  reactorName    = "draconic_reactor_0",
-  inputGateName  = "flow_gate_0",
-  outputGateName = "flow_gate_1",
+local VERSION = "1.0"
 
-  appName      = "ATM10 Reactor Control",
-  version      = "10.0",
-  monitorScale = 0.5,
+local CONFIG_PATH = "draconic_reactor_ctrl.cfg"
 
-  -- User-adjustable defaults
-  targetTemp        = 7600,
-  targetField       = 55,
-  targetSaturation  = 55,
-  targetOutput      = 20000000,
+local DEFAULTS = {
+  inputGateName = "",
+  outputGateName = "",
+  mode = "auto",                 -- auto | manual
+  autoActivate = true,
 
-  -- Charge readiness
-  chargeReadyTemp       = 2000,
-  chargeReadyField      = 50,
-  chargeReadySaturation = 50,
+  targetField = 50.0,            -- preferred steady-state field %
+  minField = 30.0,               -- scram below this while running
+  activateField = 52.0,          -- min field % before activate
 
-  -- Startup
-  activatePrimeInputFloor = 64000000,
-  activatePrimeMultiplier = 1.75,
-  activatePrimeSeconds    = 0.60,
+  targetSaturation = 45.0,       -- preferred steady-state saturation %
+  minSaturation = 15.0,          -- scram below this while running
+  activateSaturation = 50.0,     -- min saturation % before activate
 
-  startupHoldInputFloor   = 64000000,
-  startupHoldMultiplier   = 1.45,
-  startupHoldSeconds      = 4.0,
+  targetTemp = 7600,             -- high-output operating target
+  maxTemp = 7900,                -- scram above this
+  activateTemp = 2050,           -- warm-up threshold before activate
+  coolResumeTemp = 5000,         -- informational only
 
-  bleedInputFloor         = 8000000,
-  bleedInputMultiplier    = 1.35,
-  bleedOutputStart        = 250000,
-  bleedOutputRampUp       = 300000,
-  bleedOutputMax          = 12000000,
-  bleedMinSeconds         = 2.0,
-  bleedTimeoutSeconds     = 40.0,
+  baseWarmupInput = 3000000,     -- starting warm-up feed
+  maxInput = 25000000,
+  minInput = 0,
+  maxOutput = 50000000,
+  minOutput = 0,
 
-  startupExitGeneration   = 1000000,
-  startupExitField        = 50,
+  inputRampPerTick = 250000,     -- smooth gate change limits
+  outputRampPerTick = 250000,
 
-  minChargeRate       = 1000000,
-  cooldownInputFloor  = 8000000,
+  manualInput = 3000000,
+  manualOutput = 0,
 
-  -- Emergency limits
-  tempEmergency       = 7900,
-  fieldEmergency      = 18,
-  saturationEmergency = 8,
-
-  fuelSafeShutdown    = 8,
-  fuelCritical        = 4,
-
-  controlRate = 0.20,
-  uiRate      = 0.20,
-
-  -- Filtering
-  filterAlphaField = 0.15,
-  filterAlphaSat   = 0.15,
-  filterAlphaTemp  = 0.10,
-
-  -- Flow behavior
-  inputRampUp      = 6000000,
-  inputRampDown    = 1500000,
-  outputRampUp     = 1500000,
-  outputRampDown   = 6000000,
-
-  maxInput  = 2147483000,
-  maxOutput = 2147483000,
-
-  -- Simpler safety margins
-  runFieldMargin       = 8,  -- hold field above target by this margin with input
-  runTempMargin        = 150,
-  softenFieldBand      = 5,
-  softenSatBand        = 5,
-  softenTempBand       = 250,
-  recoveryFieldMargin  = 12,
-  recoveryOutputFactor = 0.20,
+  uiScale = 0.5
 }
 
-local reactor, gateIn, gateOut, monitor
-local monName
+local cfg = {}
+for k, v in pairs(DEFAULTS) do cfg[k] = v end
+
+local reactor
+local mon
 local monW, monH = 0, 0
-local buttons = {}
-local running = true
-local uiPage = "main"
-local lastInfo = nil
-local uiDirty = true
-local lastStaticPage = nil
-local screenCache = {}
+local inputGate
+local outputGate
+local inputGateName
+local outputGateName
+
+local currentInput = 0
+local currentOutput = 0
+local targetInput = 0
+local targetOutput = 0
+
+local ui = {
+  screen = "main", -- main | tuning
+  buttons = {},
+  message = "Booting...",
+  lastTouch = 0
+}
 
 local state = {
-  statusMsg = "Booting...",
-  statusColor = colors.white,
+  lastInfo = nil,
+  lastPoll = 0,
+  lastFieldPct = nil,
+  lastSatPct = nil,
+  lastTemp = nil,
+  gateWriteFailures = 0,
+  staleInfoCount = 0,
+  runningTick = 0,
+  warmupTick = 0,
+  fieldDropTicks = 0,
+  satDropTicks = 0,
+  overTempTicks = 0,
+  lastAction = "none"
+}
 
-  autoEnabled = true,
-  lowFuelLatch = false,
-  emergencyLatch = false,
-  safeStopLatch = false,
-  scramReason = nil,
-
-  mode = "idle", -- idle, charging, ready, priming, startup_hold, startup_bleed, run, recover, stopping, cooling, scram
-  readyToActivate = false,
-  activateRequested = false,
-  chargeRequested = false,
-
-  startupSince = nil,
-  bleedSince = nil,
-  primeUntil = nil,
-
-  lastInput = 0,
-  lastOutput = 0,
-  lastLoopTime = os.clock(),
-
-  filtField = nil,
-  filtSat   = nil,
-  filtTemp  = nil,
-  prevFiltField = nil,
-  prevFiltSat = nil,
-
-  fieldRecovery = false,
-  redrawQueued = false,
+local colorsEx = {
+  orange = colors.orange or colors.yellow
 }
 
 local function clamp(v, lo, hi)
@@ -143,894 +105,784 @@ local function clamp(v, lo, hi)
   return v
 end
 
-local function round(v)
-  if v >= 0 then return math.floor(v + 0.5) end
-  return math.ceil(v - 0.5)
-end
-
-local function pct(part, total)
-  if not total or total == 0 then return 0 end
-  return (part / total) * 100
+local function round(v, places)
+  local p = 10 ^ (places or 0)
+  return math.floor(v * p + 0.5) / p
 end
 
 local function fmtInt(n)
   n = tonumber(n) or 0
-  local neg = n < 0
-  n = math.abs(math.floor(n))
-  local s = tostring(n)
+  local sign = ""
+  if n < 0 then sign = "-" n = math.abs(n) end
+  local s = tostring(math.floor(n + 0.5))
   local out = ""
   while #s > 3 do
-    out = "," .. string.sub(s, -3) .. out
-    s = string.sub(s, 1, #s - 3)
+    out = "," .. s:sub(-3) .. out
+    s = s:sub(1, -4)
   end
-  out = s .. out
-  if neg then out = "-" .. out end
-  return out
+  return sign .. s .. out
 end
 
-local function fmtPct(v)
-  return string.format("%.1f%%", tonumber(v) or 0)
+local function pct(part, whole)
+  if not whole or whole == 0 then return 0 end
+  return (part / whole) * 100
 end
 
-local function setStatus(msg, col)
-  state.statusMsg = msg or ""
-  state.statusColor = col or colors.white
-  uiDirty = true
-end
-
-local function slew(current, target, upRate, downRate)
-  upRate = upRate or math.huge
-  downRate = downRate or upRate
-  if target > current then
-    return math.min(current + upRate, target)
-  elseif target < current then
-    return math.max(current - downRate, target)
+local function saveConfig()
+  local f = fs.open(CONFIG_PATH, "w")
+  if not f then return false end
+  for k, v in pairs(cfg) do
+    f.writeLine(k .. "=" .. tostring(v))
   end
-  return current
+  f.close()
+  return true
 end
 
-local function lerp(old, newVal, alpha)
-  if old == nil then return newVal end
-  return old + (newVal - old) * alpha
-end
-
-local function requestFullRedraw()
-  state.redrawQueued = true
-  uiDirty = true
-end
-
-local function requirePeripheral(name, expectedType)
-  if not peripheral.isPresent(name) then
-    error("Missing peripheral: " .. tostring(name))
+local function loadConfig()
+  if not fs.exists(CONFIG_PATH) then return false end
+  local f = fs.open(CONFIG_PATH, "r")
+  if not f then return false end
+  while true do
+    local line = f.readLine()
+    if not line then break end
+    local key, value = line:match("^([^=]+)=(.*)$")
+    if key then
+      if value == "true" then
+        cfg[key] = true
+      elseif value == "false" then
+        cfg[key] = false
+      elseif tonumber(value) then
+        cfg[key] = tonumber(value)
+      else
+        cfg[key] = value
+      end
+    end
   end
-  local ty = peripheral.getType(name)
-  if expectedType and ty ~= expectedType then
-    error("Peripheral '" .. tostring(name) .. "' is type '" .. tostring(ty) .. "', expected '" .. tostring(expectedType) .. "'")
-  end
-  local p = peripheral.wrap(name)
-  if not p then error("Failed to wrap peripheral: " .. tostring(name)) end
-  return p
+  f.close()
+  return true
 end
 
-local function findLargestMonitor()
-  local best, bestName, bestW, bestH, bestArea = nil, nil, 0, 0, -1
+local function setMessage(msg)
+  ui.message = msg
+end
+
+local function findPeripheralByTypes(types)
+  for _, name in ipairs(peripheral.getNames()) do
+    local pType = peripheral.getType(name)
+    for _, wanted in ipairs(types) do
+      if pType == wanted then
+        return peripheral.wrap(name), name, pType
+      end
+    end
+  end
+  return nil, nil, nil
+end
+
+local function wrapPeripheral(name, expectedType)
+  if not name or name == "" then return nil end
+  if not peripheral.isPresent(name) then return nil end
+  local pType = peripheral.getType(name)
+  if expectedType and pType ~= expectedType then return nil end
+  return peripheral.wrap(name)
+end
+
+local function chooseLargestMonitor()
+  local bestMon, bestName, bestArea
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "monitor" then
       local m = peripheral.wrap(name)
-      if m and m.getSize then
-        pcall(m.setTextScale, CONFIG.monitorScale)
-        local w, h = m.getSize()
+      local ok, w, h = pcall(m.getSize)
+      if ok and w and h then
         local area = w * h
-        if area > bestArea then
-          best, bestName, bestW, bestH, bestArea = m, name, w, h, area
+        if not bestArea or area > bestArea then
+          bestArea = area
+          bestMon = m
+          bestName = name
         end
       end
     end
   end
-  return best, bestName, bestW, bestH
+  return bestMon, bestName
 end
 
-local function initPeripherals()
-  if CONFIG.inputGateName == CONFIG.outputGateName then
-    error("inputGateName and outputGateName cannot be the same.")
-  end
-  reactor = requirePeripheral(CONFIG.reactorName, "draconic_reactor")
-  gateIn  = requirePeripheral(CONFIG.inputGateName, "flow_gate")
-  gateOut = requirePeripheral(CONFIG.outputGateName, "flow_gate")
-  monitor, monName, monW, monH = findLargestMonitor()
-  if not monitor then error("No monitor found.") end
-  pcall(monitor.setTextScale, CONFIG.monitorScale)
-  monW, monH = monitor.getSize()
-end
-
-local function gateSupportsOverride(g)
-  return g and g.setOverrideEnabled and g.setFlowOverride
-end
-
-local function gateSet(g, rate)
-  rate = clamp(round(rate or 0), 0, math.max(CONFIG.maxInput, CONFIG.maxOutput))
-  if gateSupportsOverride(g) then
-    pcall(g.setOverrideEnabled, true)
-    pcall(g.setFlowOverride, rate)
-    return
-  end
-  if g and g.setSignalLowFlow then
-    pcall(g.setSignalLowFlow, rate)
-    return
-  end
-  error("Unknown flow gate API.")
-end
-
-local function gateGet(g)
-  if not g then return 0 end
-  if g.getFlow then
-    local ok, v = pcall(g.getFlow)
-    if ok and type(v) == "number" then return v end
-  end
-  if g.getSignalLowFlow then
-    local ok, v = pcall(g.getSignalLowFlow)
-    if ok and type(v) == "number" then return v end
-  end
-  return 0
-end
-
-local function getInfo()
-  if not reactor or not reactor.getReactorInfo then return nil end
-  local ok, info = pcall(reactor.getReactorInfo)
-  if ok and type(info) == "table" then return info end
+local function readGate(gate)
+  if not gate then return nil end
+  local ok, value = pcall(gate.getSignalLowFlow)
+  if ok then return tonumber(value) or 0 end
   return nil
 end
 
-local function fieldPct(info)
-  return pct(info.fieldStrength or 0, info.maxFieldStrength or 0)
+local function writeGate(gate, value, kind)
+  value = math.floor(clamp(value, 0, kind == "input" and cfg.maxInput or cfg.maxOutput))
+  local ok = pcall(gate.setSignalLowFlow, value)
+  if not ok then
+    state.gateWriteFailures = state.gateWriteFailures + 1
+    return false
+  end
+
+  local back = readGate(gate)
+  if back == nil then
+    state.gateWriteFailures = state.gateWriteFailures + 1
+    return false
+  end
+
+  if math.abs(back - value) > math.max(1000, value * 0.02) then
+    state.gateWriteFailures = state.gateWriteFailures + 1
+    return false
+  end
+
+  state.gateWriteFailures = 0
+  if kind == "input" then currentInput = back else currentOutput = back end
+  return true
 end
 
-local function saturationPct(info)
-  return pct(info.energySaturation or 0, info.maxEnergySaturation or 0)
+local function smoothStep(current, target, maxStep)
+  if current < target then
+    return math.min(current + maxStep, target)
+  elseif current > target then
+    return math.max(current - maxStep, target)
+  end
+  return current
+end
+
+local function detectPeripherals()
+  reactor = nil
+  local reactorTypes = {
+    "draconic_reactor",
+    "draconic_reactor_component",
+    "draconicreactor"
+  }
+
+  reactor = select(1, findPeripheralByTypes(reactorTypes))
+  if not reactor then
+    for _, name in ipairs(peripheral.getNames()) do
+      local p = peripheral.wrap(name)
+      if p and type(p.getReactorInfo) == "function" then
+        reactor = p
+        break
+      end
+    end
+  end
+
+  mon = select(1, chooseLargestMonitor())
+  if mon then
+    pcall(mon.setTextScale, cfg.uiScale)
+    mon.setBackgroundColor(colors.black)
+    mon.setTextColor(colors.white)
+    mon.clear()
+    monW, monH = mon.getSize()
+  end
+
+  inputGateName = cfg.inputGateName
+  outputGateName = cfg.outputGateName
+  inputGate = wrapPeripheral(inputGateName, "flow_gate")
+  outputGate = wrapPeripheral(outputGateName, "flow_gate")
+
+  return reactor ~= nil and mon ~= nil and inputGate ~= nil and outputGate ~= nil
+end
+
+local function promptForGateNames()
+  term.setBackgroundColor(colors.black)
+  term.setTextColor(colors.white)
+  term.clear()
+  term.setCursorPos(1, 1)
+  print("Draconic Reactor Controller v" .. VERSION)
+  print("")
+  print("Detected peripherals:")
+  for _, name in ipairs(peripheral.getNames()) do
+    print(" - " .. name .. " [" .. tostring(peripheral.getType(name)) .. "]")
+  end
+  print("")
+  write("Enter INPUT flow gate name: ")
+  cfg.inputGateName = read()
+  write("Enter OUTPUT flow gate name: ")
+  cfg.outputGateName = read()
+  saveConfig()
+end
+
+local function ensureSetup()
+  loadConfig()
+
+  while true do
+    local ok = detectPeripherals()
+    if ok then
+      currentInput = readGate(inputGate) or cfg.manualInput or 0
+      currentOutput = readGate(outputGate) or cfg.manualOutput or 0
+      return
+    end
+
+    if not cfg.inputGateName or cfg.inputGateName == "" or not cfg.outputGateName or cfg.outputGateName == "" then
+      promptForGateNames()
+    else
+      term.setBackgroundColor(colors.black)
+      term.setTextColor(colors.white)
+      term.clear()
+      term.setCursorPos(1, 1)
+      print("Waiting for peripherals...")
+      print("")
+      print("Need:")
+      print(" - Reactor peripheral")
+      print(" - Monitor")
+      print(" - Input gate:  " .. tostring(cfg.inputGateName))
+      print(" - Output gate: " .. tostring(cfg.outputGateName))
+      print("")
+      print("Press R to re-enter gate names.")
+      local timer = os.startTimer(2)
+      while true do
+        local e, p = os.pullEvent()
+        if e == "char" and (p == "r" or p == "R") then
+          promptForGateNames()
+          break
+        elseif e == "timer" and p == timer then
+          break
+        end
+      end
+    end
+  end
+end
+
+local function getInfo()
+  if not reactor then return nil end
+  local ok, info = pcall(reactor.getReactorInfo)
+  if not ok or type(info) ~= "table" then return nil end
+  return info
+end
+
+local function fieldPct(info)
+  return pct(info.fieldStrength or 0, info.maxFieldStrength or 1)
+end
+
+local function satPct(info)
+  return pct(info.energySaturation or 0, info.maxEnergySaturation or 1)
 end
 
 local function fuelPct(info)
-  local maxFuel = info.maxFuelConversion or 0
-  if maxFuel <= 0 then return 0 end
-  return 100 - pct(info.fuelConversion or 0, maxFuel)
+  local maxFuel = info.maxFuelConversion or 1
+  local used = info.fuelConversion or 0
+  return clamp(100 - pct(used, maxFuel), 0, 100)
 end
 
-local function statusLabel(status)
-  local map = {
-    running = "RUNNING",
-    online = "RUNNING",
-    cold = "OFFLINE",
-    warming_up = "CHARGING",
-    stopping = "STOPPING",
-    cooling = "COOLING",
-    beyond_hope = "FAILING",
-    invalid = "INVALID",
-  }
-  return map[status] or tostring(status or "UNKNOWN"):upper()
+local function reactorStatus(info)
+  return tostring(info.status or "unknown")
 end
 
-local function reactorStatusColor(status)
-  if status == "running" or status == "online" then return colors.lime end
-  if status == "warming_up" then return colors.yellow end
+local function statusColor(status)
+  if status == "running" then return colors.lime end
+  if status == "warming_up" then return colorsEx.orange end
+  if status == "cooling" then return colors.lightBlue end
   if status == "stopping" then return colors.red end
-  if status == "cooling" then return colors.orange end
-  if status == "beyond_hope" then return colors.red end
   return colors.lightGray
 end
 
-local function isRunningStatus(status)
-  return status == "running" or status == "online"
+local function fieldColor(v)
+  if v >= cfg.targetField then return colors.lime end
+  if v >= cfg.minField then return colors.yellow end
+  return colors.red
 end
 
-local function isWarmupStatus(status)
-  return status == "warming_up"
+local function satColor(v)
+  if v >= cfg.targetSaturation then return colors.lime end
+  if v >= cfg.minSaturation then return colors.yellow end
+  return colors.red
 end
 
-local function isHardFailStatus(status)
-  return status == "beyond_hope" or status == "invalid"
+local function tempColor(v)
+  if v <= cfg.targetTemp then return colors.lime end
+  if v <= cfg.maxTemp then return colors.yellow end
+  return colors.red
 end
 
-local function chargeReady(info)
-  return (info.temperature or 0) >= CONFIG.chargeReadyTemp
-     and fieldPct(info) >= CONFIG.chargeReadyField
-     and saturationPct(info) >= CONFIG.chargeReadySaturation
-     and isWarmupStatus(info.status)
-end
-
-local function computeBaseInput(info, targetFieldValue)
-  local tf = clamp(targetFieldValue / 100, 0.05, 0.95)
-  local drain = info and (info.fieldDrainRate or 0) or 0
-  return drain / math.max(0.05, (1 - tf))
-end
-
-local function holdInputSafe(info, targetFieldValue, floorValue, multiplier)
-  multiplier = multiplier or 1.0
-  local base = computeBaseInput(info, targetFieldValue)
-  local want = math.max(base * multiplier, floorValue or 0)
-  want = clamp(want, 0, CONFIG.maxInput)
-  gateSet(gateIn, want)
-  state.lastInput = want
-  return want
-end
-
-local function updateFiltered(info)
-  local rawField = fieldPct(info)
-  local rawSat   = saturationPct(info)
-  local rawTemp  = info.temperature or 0
-
-  state.prevFiltField = state.filtField
-  state.prevFiltSat = state.filtSat
-  state.filtField = lerp(state.filtField, rawField, CONFIG.filterAlphaField)
-  state.filtSat   = lerp(state.filtSat, rawSat, CONFIG.filterAlphaSat)
-  state.filtTemp  = lerp(state.filtTemp, rawTemp, CONFIG.filterAlphaTemp)
-end
-
--- UI helpers
-local function clearButtons() buttons = {} end
-local function clearCache() screenCache = {} end
-local function cacheWrite(key, x, y, text, fg, bg)
-  local sig = tostring(text) .. "|" .. tostring(fg or "") .. "|" .. tostring(bg or "")
-  if screenCache[key] == sig then return end
-  screenCache[key] = sig
-  if bg then monitor.setBackgroundColor(bg) end
-  if fg then monitor.setTextColor(fg) end
-  monitor.setCursorPos(x, y)
-  monitor.write(text)
-end
-local function writeAt(x, y, text, fg, bg)
-  cacheWrite(("T:%d:%d"):format(x, y), x, y, text, fg, bg)
-end
-local function fillRect(x1, y1, x2, y2, bg)
-  for y = y1, y2 do
-    cacheWrite(("F:%d:%d:%d"):format(x1, y, x2), x1, y, (" "):rep(x2 - x1 + 1), nil, bg)
+local function bar(x, y, w, value, maxValue, fg, bg)
+  value = clamp(value, 0, maxValue)
+  local fill = 0
+  if maxValue > 0 then
+    fill = math.floor((value / maxValue) * w + 0.5)
   end
-end
-local function addButton(id, x1, y1, x2, y2, label, bg, fg, fn)
-  buttons[id] = { x1=x1, y1=y1, x2=x2, y2=y2, label=label, bg=bg, fg=fg, fn=fn }
-end
-local function drawButton(b)
-  fillRect(b.x1, b.y1, b.x2, b.y2, b.bg)
-  local tx = math.floor((b.x1 + b.x2 - #b.label) / 2)
-  local ty = math.floor((b.y1 + b.y2) / 2)
-  writeAt(tx, ty, b.label, b.fg, b.bg)
-end
-local function drawBar(x, y, w, valuePct, fillColor, backColor, label)
-  valuePct = clamp(valuePct or 0, 0, 100)
-  local fillW = math.floor((w * valuePct) / 100)
-  for i = 0, w - 1 do
-    local bg = (i < fillW) and fillColor or backColor
-    cacheWrite(("B:%d:%d:%d"):format(x + i, y, i), x + i, y, " ", colors.white, bg)
-  end
-  local txt = label .. " " .. string.format("%5.1f%%", valuePct)
-  local tx = x + math.max(0, math.floor((w - #txt) / 2))
-  writeAt(tx, y, txt, colors.white, colors.black)
-end
-
-local function drawMainStatic()
-  clearButtons(); clearCache()
-  monitor.setBackgroundColor(colors.black); monitor.clear()
-
-  writeAt(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
-  writeAt(math.max(2, monW - 8), 1, "MAIN", colors.lightGray, colors.black)
-
-  writeAt(2, 3, "Status:", colors.white, colors.black)
-  writeAt(2, 4, "Mode:", colors.white, colors.black)
-  writeAt(2, 6, "Reactor:", colors.lightGray, colors.black)
-  writeAt(2, 7, "Input:", colors.lightGray, colors.black)
-  writeAt(2, 8, "Output:", colors.lightGray, colors.black)
-  writeAt(2, 10, "Temp:", colors.white, colors.black)
-  writeAt(2, 11, "Generate:", colors.white, colors.black)
-  writeAt(2, 12, "Drain:", colors.white, colors.black)
-  writeAt(2, 13, "Fuel Rate:", colors.white, colors.black)
-  writeAt(2, 14, "Input Set:", colors.lightBlue, colors.black)
-  writeAt(2, 15, "Output Set:", colors.lightBlue, colors.black)
-
-  addButton("charge", 2, 28, 13, 30, "Charge", colors.yellow, colors.black, function()
-    state.chargeRequested = true; uiDirty = true
-  end)
-  addButton("activate", 15, 28, 28, 30, "Activate", colors.lime, colors.black, function()
-    state.activateRequested = true; uiDirty = true
-  end)
-  addButton("scram", 30, 28, 41, 30, "SCRAM", colors.red, colors.white, function()
-    state.activateRequested = false; state.chargeRequested = false
-    state.mode = "scram"; state.scramReason = "Operator SCRAM"; uiDirty = true
-  end)
-  addButton("auto", 43, 28, 55, 30,
-    state.autoEnabled and "Auto ON" or "Auto OFF",
-    state.autoEnabled and colors.green or colors.orange,
-    colors.black,
-    function()
-      state.autoEnabled = not state.autoEnabled
-      setStatus(state.autoEnabled and "Auto enabled" or "Auto paused", state.autoEnabled and colors.lime or colors.orange)
-      uiDirty = true
-    end
-  )
-  addButton("tune", 57, 28, math.max(68, monW - 2), 30, "Tune", colors.cyan, colors.black, function()
-    uiPage = "tune"; requestFullRedraw()
-  end)
-
-  for _, b in pairs(buttons) do drawButton(b) end
-end
-
-local function drawMainDynamic(info)
-  local fp = info and fieldPct(info) or 0
-  local sp = info and saturationPct(info) or 0
-  local fup = info and fuelPct(info) or 0
-  local tpct = info and pct(info.temperature or 0, CONFIG.tempEmergency) or 0
-
-  writeAt(10, 3, (" "):rep(24), colors.white, colors.black)
-  writeAt(10, 3, info and statusLabel(info.status) or "NO DATA", info and reactorStatusColor(info.status) or colors.red, colors.black)
-  writeAt(8, 4, (" "):rep(24), colors.white, colors.black)
-  writeAt(8, 4, string.upper(state.mode), colors.yellow, colors.black)
-  writeAt(11, 6, CONFIG.reactorName .. (" "):rep(20), colors.lightGray, colors.black)
-  writeAt(11, 7, CONFIG.inputGateName .. (" "):rep(20), colors.lightGray, colors.black)
-  writeAt(11, 8, CONFIG.outputGateName .. (" "):rep(20), colors.lightGray, colors.black)
-
-  if info then
-    writeAt(14, 10, fmtInt(info.temperature or 0) .. " C" .. (" "):rep(16), colors.white, colors.black)
-    writeAt(14, 11, fmtInt(info.generationRate or 0) .. " RF/t" .. (" "):rep(12), colors.white, colors.black)
-    writeAt(14, 12, fmtInt(info.fieldDrainRate or 0) .. " RF/t" .. (" "):rep(12), colors.white, colors.black)
-    writeAt(14, 13, fmtInt(info.fuelConversionRate or 0) .. " nb/t" .. (" "):rep(12), colors.white, colors.black)
-    writeAt(14, 14, fmtInt(gateGet(gateIn)) .. " RF/t" .. (" "):rep(12), colors.lightBlue, colors.black)
-    writeAt(14, 15, fmtInt(gateGet(gateOut)) .. " RF/t" .. (" "):rep(12), colors.lightBlue, colors.black)
-  end
-
-  drawBar(2, 17, monW - 4, tpct, colors.red, colors.gray, "TEMP LIMIT")
-  drawBar(2, 19, monW - 4, fp, colors.blue, colors.gray, "FIELD")
-  drawBar(2, 21, monW - 4, sp, colors.green, colors.gray, "SATURATION")
-  drawBar(2, 23, monW - 4, fup, colors.orange, colors.gray, "FUEL")
-
-  writeAt(2, 25,
-    ("Targets O:%s T:%dC F:%s S:%s"):format(
-      fmtInt(CONFIG.targetOutput), CONFIG.targetTemp, fmtPct(CONFIG.targetField), fmtPct(CONFIG.targetSaturation)
-    ) .. (" "):rep(10),
-    colors.yellow, colors.black
-  )
-
-  writeAt(2, 26, (" "):rep(monW - 2), colors.white, colors.black)
-  writeAt(2, 26, "Status: " .. state.statusMsg, state.statusColor, colors.black)
-
-  if buttons["auto"] then
-    buttons["auto"].label = state.autoEnabled and "Auto ON" or "Auto OFF"
-    buttons["auto"].bg = state.autoEnabled and colors.green or colors.orange
-    drawButton(buttons["auto"])
-  end
-end
-
-local function tuneAdjust(key, delta, minVal, maxVal)
-  CONFIG[key] = clamp((CONFIG[key] or 0) + delta, minVal, maxVal)
-  uiDirty = true
-end
-
-local function addTuneRow(y, label, value, defs)
-  writeAt(3, y, label, colors.white, colors.black)
-  writeAt(26, y, value .. (" "):rep(12), colors.yellow, colors.black)
-  local x = 40
-  for _, def in ipairs(defs) do
-    addButton(def.id, x, y - 1, x + 5, y, def.label, def.bg, def.fg, def.fn)
-    x = x + 7
-  end
-end
-
-local function drawTuneStatic()
-  clearButtons(); clearCache()
-  monitor.setBackgroundColor(colors.black); monitor.clear()
-
-  writeAt(2, 1, CONFIG.appName .. " v" .. CONFIG.version, colors.cyan, colors.black)
-  writeAt(math.max(2, monW - 8), 1, "TUNE", colors.lightGray, colors.black)
-
-  writeAt(3, 3, "Simple target-output controller", colors.white, colors.black)
-  writeAt(3, 4, "Set output / temp / field / saturation live.", colors.lightGray, colors.black)
-  writeAt(3, 5, "Controller pushes output until a target gets too close.", colors.lightGray, colors.black)
-
-  addButton("back", 2, 28, 13, 30, "Back", colors.cyan, colors.black, function()
-    uiPage = "main"; requestFullRedraw()
-  end)
-
-  addTuneRow(8, "Target Output", fmtInt(CONFIG.targetOutput), {
-    { id="to_m10m", label="-10M", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetOutput", -10000000, 0, CONFIG.maxOutput) end },
-    { id="to_m1m",  label="-1M",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetOutput", -1000000, 0, CONFIG.maxOutput) end },
-    { id="to_p1m",  label="+1M",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetOutput", 1000000, 0, CONFIG.maxOutput) end },
-    { id="to_p10m", label="+10M", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetOutput", 10000000, 0, CONFIG.maxOutput) end },
-  })
-
-  addTuneRow(12, "Target Temp", tostring(CONFIG.targetTemp), {
-    { id="tt_m100", label="-100", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetTemp", -100, 6000, 7900) end },
-    { id="tt_m10",  label="-10",  bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetTemp", -10, 6000, 7900) end },
-    { id="tt_p10",  label="+10",  bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetTemp", 10, 6000, 7900) end },
-    { id="tt_p100", label="+100", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetTemp", 100, 6000, 7900) end },
-  })
-
-  addTuneRow(16, "Target Field", fmtPct(CONFIG.targetField), {
-    { id="tf_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetField", -5, 35, 80) end },
-    { id="tf_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetField", -1, 35, 80) end },
-    { id="tf_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetField", 1, 35, 80) end },
-    { id="tf_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetField", 5, 35, 80) end },
-  })
-
-  addTuneRow(20, "Target Sat", fmtPct(CONFIG.targetSaturation), {
-    { id="ts_m5", label="-5", bg=colors.red, fg=colors.white, fn=function() tuneAdjust("targetSaturation", -5, 25, 95) end },
-    { id="ts_m1", label="-1", bg=colors.orange, fg=colors.black, fn=function() tuneAdjust("targetSaturation", -1, 25, 95) end },
-    { id="ts_p1", label="+1", bg=colors.lime, fg=colors.black, fn=function() tuneAdjust("targetSaturation", 1, 25, 95) end },
-    { id="ts_p5", label="+5", bg=colors.green, fg=colors.black, fn=function() tuneAdjust("targetSaturation", 5, 25, 95) end },
-  })
-
-  for _, b in pairs(buttons) do drawButton(b) end
-end
-
-local function drawTuneDynamic()
-  writeAt(26, 8, fmtInt(CONFIG.targetOutput) .. (" "):rep(12), colors.yellow, colors.black)
-  writeAt(26, 12, tostring(CONFIG.targetTemp) .. (" "):rep(12), colors.yellow, colors.black)
-  writeAt(26, 16, fmtPct(CONFIG.targetField) .. (" "):rep(12), colors.yellow, colors.black)
-  writeAt(26, 20, fmtPct(CONFIG.targetSaturation) .. (" "):rep(12), colors.yellow, colors.black)
-  writeAt(3, 23, "Current mode: " .. string.upper(state.mode) .. (" "):rep(20), colors.lightBlue, colors.black)
-  writeAt(3, 24, (" "):rep(monW - 4), colors.white, colors.black)
-  writeAt(3, 24, "Status: " .. state.statusMsg, state.statusColor, colors.black)
-end
-
-local function redraw(forceStatic)
-  forceStatic = forceStatic or false
-  if forceStatic or lastStaticPage ~= uiPage then
-    if uiPage == "tune" then drawTuneStatic() else drawMainStatic() end
-    lastStaticPage = uiPage
-    uiDirty = true
-  end
-  if uiPage == "tune" then drawTuneDynamic() else drawMainDynamic(lastInfo) end
-end
-
-local function handleTouch(side, x, y)
-  if side ~= monName then return end
-  for _, b in pairs(buttons) do
-    if x >= b.x1 and x <= b.x2 and y >= b.y1 and y <= b.y2 then
-      local oldPage = uiPage
-      if b.fn then b.fn() end
-      if uiPage ~= oldPage then requestFullRedraw() else uiDirty = true end
-      return
-    end
-  end
-end
-
--- Control actions
-local function scram(reason)
-  state.emergencyLatch = true
-  state.safeStopLatch = true
-  state.scramReason = reason or "SCRAM"
-  state.mode = "scram"
-  state.readyToActivate = false
-  state.activateRequested = false
-  state.chargeRequested = false
-  state.startupSince = nil
-  state.bleedSince = nil
-  state.primeUntil = nil
-  state.fieldRecovery = false
-  pcall(function() reactor.stopReactor() end)
-  gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 55), CONFIG.startupHoldInputFloor, 1.20)
-  state.lastOutput = 0
-  setStatus("SCRAM: " .. tostring(state.scramReason), colors.red)
-end
-
-local function safeShutdown(reason)
-  state.safeStopLatch = true
-  state.readyToActivate = false
-  state.activateRequested = false
-  state.startupSince = nil
-  state.bleedSince = nil
-  state.primeUntil = nil
-  state.fieldRecovery = false
-  pcall(function() reactor.stopReactor() end)
-  gateSet(gateOut, 0)
-  holdInputSafe(lastInfo, math.max(CONFIG.targetField, 55), CONFIG.cooldownInputFloor, 1.08)
-  state.lastOutput = 0
-  state.mode = "stopping"
-  setStatus(reason or "Safe shutdown", colors.orange)
-end
-
-local function processOperatorRequests(info)
-  if state.chargeRequested then
-    state.chargeRequested = false
-    state.activateRequested = false
-    state.readyToActivate = false
-    state.startupSince = nil
-    state.bleedSince = nil
-    state.primeUntil = nil
-    state.fieldRecovery = false
-    state.mode = "charging"
-    pcall(function() reactor.chargeReactor() end)
-    gateSet(gateOut, 0)
-    holdInputSafe(info, 60, CONFIG.minChargeRate, 1.25)
-    state.lastOutput = 0
-    uiDirty = true
-    setStatus("Charging reactor", colors.yellow)
-  end
-
-  if state.activateRequested then
-    state.activateRequested = false
-    if state.lowFuelLatch then
-      setStatus("Blocked: low fuel latch active", colors.red)
-      return
-    end
-    if not info or not chargeReady(info) then
-      state.readyToActivate = false
-      setStatus("Not ready: charge to 2000C / 50% field / 50% sat", colors.orange)
-      return
-    end
-    gateSet(gateOut, 0)
-    holdInputSafe(info, 60, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
-    state.lastOutput = 0
-    state.mode = "priming"
-    state.primeUntil = os.clock() + CONFIG.activatePrimeSeconds
-    uiDirty = true
-    setStatus("Priming injector before activation", colors.yellow)
-  end
-end
-
-local function emergencyCheck(info)
-  if not info then scram("Lost reactor data"); return true end
-  if isHardFailStatus(info.status) then scram("Reactor entered " .. tostring(info.status)); return true end
-
-  local fp = fieldPct(info)
-  local sp = saturationPct(info)
-  local fup = fuelPct(info)
-  local temp = info.temperature or 0
-
-  if fup <= CONFIG.fuelCritical and (isRunningStatus(info.status) or isWarmupStatus(info.status)) then
-    state.lowFuelLatch = true
-    scram("Critical fuel low")
-    return true
-  end
-  if fup <= CONFIG.fuelSafeShutdown and isRunningStatus(info.status) then
-    state.lowFuelLatch = true
-    safeShutdown("Fuel low safe shutdown")
-    return true
-  end
-  if temp >= CONFIG.tempEmergency then scram("Temperature emergency"); return true end
-  if fp <= CONFIG.fieldEmergency and isRunningStatus(info.status) then scram("Field emergency"); return true end
-  if sp <= CONFIG.saturationEmergency and isRunningStatus(info.status) then scram("Saturation emergency"); return true end
-  return false
-end
-
-local function applyChargingControl(info)
-  gateSet(gateOut, 0)
-  holdInputSafe(info, 60, CONFIG.minChargeRate, 1.25)
-  state.lastOutput = 0
-  if chargeReady(info) then
-    state.readyToActivate = true
-    state.mode = "ready"
-    uiDirty = true
-    setStatus("READY - press Activate", colors.lime)
-  else
-    state.readyToActivate = false
-    state.mode = "charging"
-    setStatus("Charging / warming up", colors.yellow)
-  end
-end
-
-local function applyCoolingControl(info)
-  gateSet(gateOut, 0)
-  holdInputSafe(info, math.max(CONFIG.targetField, 55), CONFIG.cooldownInputFloor, 1.05)
-  state.lastOutput = 0
-  if state.safeStopLatch then setStatus("Safe shutdown in progress", colors.orange)
-  else setStatus("Cooling reactor", colors.orange) end
-end
-
-local function applyPrimingControl(info)
-  gateSet(gateOut, 0)
-  holdInputSafe(info, 60, CONFIG.activatePrimeInputFloor, CONFIG.activatePrimeMultiplier)
-  state.lastOutput = 0
-  if os.clock() >= (state.primeUntil or 0) then
-    pcall(function() reactor.activateReactor() end)
-    state.primeUntil = nil
-    state.startupSince = os.clock()
-    state.bleedSince = nil
-    state.fieldRecovery = false
-    state.mode = "startup_hold"
-    uiDirty = true
-    setStatus("Activated - startup hold", colors.lime)
-  else
-    setStatus("Priming injector before activation", colors.yellow)
-  end
-end
-
-local function applyStartupHoldControl(info)
-  local elapsed = os.clock() - (state.startupSince or os.clock())
-  gateSet(gateOut, 0)
-  state.lastOutput = 0
-  local base = computeBaseInput(info, 60)
-  local wantIn = math.max(base * CONFIG.startupHoldMultiplier, CONFIG.startupHoldInputFloor)
-  wantIn = clamp(wantIn, 0, CONFIG.maxInput)
-  gateSet(gateIn, wantIn)
-  state.lastInput = wantIn
-  if elapsed >= CONFIG.startupHoldSeconds then
-    state.mode = "startup_bleed"
-    state.bleedSince = os.clock()
-    state.lastOutput = CONFIG.bleedOutputStart
-    gateSet(gateOut, CONFIG.bleedOutputStart)
-    uiDirty = true
-    setStatus("Startup bleed phase", colors.yellow)
-    return
-  end
-  state.mode = "startup_hold"
-  setStatus(("Startup hold %.1fs"):format(elapsed), colors.yellow)
-end
-
-local function applyStartupBleedControl(info)
-  local fp = fieldPct(info)
-  local gen = info.generationRate or 0
-  local elapsed = os.clock() - (state.bleedSince or os.clock())
-
-  local bleedFieldTarget = math.max(CONFIG.targetField + CONFIG.runFieldMargin, 60)
-  local baseIn = computeBaseInput(info, bleedFieldTarget)
-  local wantIn = math.max(baseIn * CONFIG.bleedInputMultiplier, CONFIG.bleedInputFloor)
-  wantIn = clamp(wantIn, 0, CONFIG.maxInput)
-  gateSet(gateIn, wantIn)
-  state.lastInput = wantIn
-
-  local bleedTarget = clamp(state.lastOutput + CONFIG.bleedOutputRampUp, 0, CONFIG.bleedOutputMax)
-  if fp < math.max(CONFIG.targetField + 2, 45) then
-    bleedTarget = math.max(0, state.lastOutput - (CONFIG.bleedOutputRampUp * 2))
-  end
-  gateSet(gateOut, bleedTarget)
-  state.lastOutput = bleedTarget
-
-  local readyForRun = elapsed >= CONFIG.bleedMinSeconds and gen >= CONFIG.startupExitGeneration and fp >= CONFIG.startupExitField and isRunningStatus(info.status)
-  local timeoutFallback = elapsed >= CONFIG.bleedTimeoutSeconds and gen > 0 and fp >= 45 and isRunningStatus(info.status)
-
-  if readyForRun or timeoutFallback then
-    state.mode = "run"
-    state.fieldRecovery = false
-    uiDirty = true
-    setStatus("Startup complete - run mode", colors.lime)
-    return
-  end
-  state.mode = "startup_bleed"
-  setStatus(("Startup bleed %.1fs In:%s Out:%s"):format(elapsed, fmtInt(wantIn), fmtInt(bleedTarget)), colors.yellow)
-end
-
-local function applyRunControl(info)
-  local rawField = fieldPct(info)
-  local rawSat = saturationPct(info)
-  local rawTemp = info.temperature or 0
-  local fField = state.filtField or rawField
-  local fSat = state.filtSat or rawSat
-  local fTemp = state.filtTemp or rawTemp
-  local prevField = state.prevFiltField or fField
-  local fieldDelta = fField - prevField
-  local gen = info.generationRate or 0
-
-  -- INPUT: keep field above target + reserve margin.
-  local desiredField = clamp(CONFIG.targetField + CONFIG.runFieldMargin, CONFIG.targetField + 2, 85)
-  local baseIn = computeBaseInput(info, desiredField)
-  local wantIn = math.max(baseIn, info.fieldDrainRate or 0)
-
-  if fField < desiredField then
-    wantIn = wantIn + (desiredField - fField) * 900000
-  end
-  if rawField < desiredField then
-    wantIn = wantIn + (desiredField - rawField) * 700000
-  end
-  if fieldDelta < 0 then
-    wantIn = wantIn + math.abs(fieldDelta) * 1200000
-  end
-  if fTemp > (CONFIG.targetTemp + CONFIG.runTempMargin) then
-    wantIn = wantIn + (fTemp - CONFIG.targetTemp) * 12000
-  end
-
-  wantIn = clamp(wantIn, 0, CONFIG.maxInput)
-  wantIn = slew(state.lastInput, wantIn, CONFIG.inputRampUp, CONFIG.inputRampDown)
-
-  -- OUTPUT: aim for user target, reduce only when a parameter is getting too close.
-  local targetOut = clamp(CONFIG.targetOutput, 0, CONFIG.maxOutput)
-  local allowedOut = targetOut
-
-  local fieldShort = CONFIG.targetField - math.min(fField, rawField)
-  if fieldShort > 0 then
-    allowedOut = math.min(allowedOut, math.max(0, state.lastOutput - fieldShort * 3000000))
-    state.fieldRecovery = true
-  elseif math.min(fField, rawField) < (CONFIG.targetField + CONFIG.softenFieldBand) or fieldDelta < -0.8 then
-    local softness = math.max((CONFIG.targetField + CONFIG.softenFieldBand) - math.min(fField, rawField), 0)
-    allowedOut = math.min(allowedOut, state.lastOutput + 500000 - softness * 1500000)
-  end
-
-  local satShort = CONFIG.targetSaturation - rawSat
-  if satShort > 0 then
-    allowedOut = math.min(allowedOut, math.max(0, state.lastOutput - satShort * 2200000))
-  elseif rawSat < (CONFIG.targetSaturation + CONFIG.softenSatBand) then
-    local softness = (CONFIG.targetSaturation + CONFIG.softenSatBand) - rawSat
-    allowedOut = math.min(allowedOut, state.lastOutput + 400000 - softness * 900000)
-  end
-
-  local tempLow = CONFIG.targetTemp - rawTemp
-  if tempLow > 0 then
-    local lowBand = CONFIG.softenTempBand
-    if tempLow > lowBand then
-      local deficit = tempLow - lowBand
-      allowedOut = math.min(allowedOut, math.max(0, state.lastOutput - deficit * 25000))
-    end
-  end
-
-  local tempHigh = rawTemp - CONFIG.targetTemp
-  if tempHigh > 0 then
-    local extra = math.min(tempHigh * 18000, CONFIG.maxOutput)
-    allowedOut = math.min(CONFIG.maxOutput, math.max(allowedOut, targetOut + extra))
-  end
-
-  -- Cold start kick: if fully saturated and still cold, allow a modest pull to get generation moving.
-  if rawTemp < (CONFIG.targetTemp - 1500) and rawSat > (CONFIG.targetSaturation + 20) and math.min(fField, rawField) > (CONFIG.targetField + 10) then
-    allowedOut = math.max(allowedOut, math.min(targetOut, 8000000))
-  end
-
-  if state.fieldRecovery then
-    if math.min(fField, rawField) >= (CONFIG.targetField + CONFIG.recoveryFieldMargin) and fieldDelta >= -0.2 then
-      state.fieldRecovery = false
+  mon.setCursorPos(x, y)
+  for i = 1, w do
+    if i <= fill then
+      mon.setBackgroundColor(fg)
     else
-      allowedOut = math.min(allowedOut, math.max(gen * CONFIG.recoveryOutputFactor, 0))
-      wantIn = math.max(wantIn, computeBaseInput(info, CONFIG.targetField + CONFIG.recoveryFieldMargin))
+      mon.setBackgroundColor(bg)
+    end
+    mon.write(" ")
+  end
+  mon.setBackgroundColor(colors.black)
+end
+
+local function text(x, y, s, tc, bc)
+  mon.setCursorPos(x, y)
+  if bc then mon.setBackgroundColor(bc) end
+  if tc then mon.setTextColor(tc) end
+  mon.write(s)
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
+end
+
+local function clearLine(y)
+  mon.setCursorPos(1, y)
+  mon.setBackgroundColor(colors.black)
+  mon.clearLine()
+end
+
+local function drawBox(x1, y1, x2, y2, border, fill)
+  fill = fill or colors.black
+  for y = y1, y2 do
+    mon.setCursorPos(x1, y)
+    for x = x1, x2 do
+      if y == y1 or y == y2 or x == x1 or x == x2 then
+        mon.setBackgroundColor(border)
+      else
+        mon.setBackgroundColor(fill)
+      end
+      mon.write(" ")
+    end
+  end
+  mon.setBackgroundColor(colors.black)
+end
+
+local function addButton(id, x1, y1, x2, y2, label, callback, bg, fg)
+  table.insert(ui.buttons, {
+    id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2,
+    label = label, callback = callback,
+    bg = bg or colors.gray, fg = fg or colors.white
+  })
+end
+
+local function drawButton(btn)
+  for y = btn.y1, btn.y2 do
+    mon.setCursorPos(btn.x1, y)
+    mon.setBackgroundColor(btn.bg)
+    mon.setTextColor(btn.fg)
+    mon.write(string.rep(" ", btn.x2 - btn.x1 + 1))
+  end
+  local cx = math.floor((btn.x1 + btn.x2 - #btn.label) / 2)
+  local cy = math.floor((btn.y1 + btn.y2) / 2)
+  text(cx, cy, btn.label, btn.fg, btn.bg)
+  mon.setBackgroundColor(colors.black)
+  mon.setTextColor(colors.white)
+end
+
+local function addParamButtons(name, display, y, stepSmall, stepBig, minVal, maxVal)
+  text(3, y, display, colors.white)
+  local val = cfg[name]
+  text(monW - 16, y, tostring(round(val, 1)), colors.cyan)
+
+  addButton(name .. "_mBig", 3, y + 1, 9, y + 2, "-big", function()
+    cfg[name] = clamp(cfg[name] - stepBig, minVal, maxVal)
+    saveConfig()
+  end, colors.red)
+  addButton(name .. "_mSmall", 11, y + 1, 17, y + 2, "-sm", function()
+    cfg[name] = clamp(cfg[name] - stepSmall, minVal, maxVal)
+    saveConfig()
+  end, colors.orange)
+  addButton(name .. "_pSmall", 19, y + 1, 25, y + 2, "+sm", function()
+    cfg[name] = clamp(cfg[name] + stepSmall, minVal, maxVal)
+    saveConfig()
+  end, colors.lime)
+  addButton(name .. "_pBig", 27, y + 1, 33, y + 2, "+big", function()
+    cfg[name] = clamp(cfg[name] + stepBig, minVal, maxVal)
+    saveConfig()
+  end, colors.green)
+end
+
+local function chargeReactor()
+  if reactor and type(reactor.chargeReactor) == "function" then
+    pcall(reactor.chargeReactor)
+    state.lastAction = "charge"
+    setMessage("Charge requested")
+  end
+end
+
+local function activateReactor()
+  if reactor and type(reactor.activateReactor) == "function" then
+    pcall(reactor.activateReactor)
+    state.lastAction = "activate"
+    setMessage("Activate requested")
+  end
+end
+
+local function stopReactor()
+  if reactor and type(reactor.stopReactor) == "function" then
+    pcall(reactor.stopReactor)
+    state.lastAction = "stop"
+    setMessage("Stop requested")
+  end
+end
+
+local function scram(reason)
+  targetOutput = 0
+  targetInput = cfg.maxInput
+  writeGate(outputGate, 0, "output")
+  writeGate(inputGate, cfg.maxInput, "input")
+  stopReactor()
+  setMessage("SCRAM: " .. tostring(reason))
+end
+
+local function updateAutoTargets(info)
+  local status = reactorStatus(info)
+  local fPct = fieldPct(info)
+  local sPct = satPct(info)
+  local temp = tonumber(info.temperature or 0)
+  local drain = tonumber(info.fieldDrainRate or 0)
+  local gen = tonumber(info.generationRate or 0)
+
+  local requiredForField = 0
+  local fieldTargetFrac = clamp(cfg.targetField / 100, 0.05, 0.95)
+  requiredForField = drain / (1 - fieldTargetFrac)
+
+  if status == "cold" then
+    targetOutput = 0
+    targetInput = 0
+    return
+  end
+
+  if status == "warming_up" then
+    state.warmupTick = state.warmupTick + 1
+    targetOutput = 0
+
+    local warmBoost = cfg.baseWarmupInput
+    if fPct < cfg.activateField then
+      warmBoost = warmBoost + (cfg.activateField - fPct) * 220000
+    end
+    if sPct < cfg.activateSaturation then
+      warmBoost = warmBoost + (cfg.activateSaturation - sPct) * 120000
+    end
+    if temp < cfg.activateTemp then
+      warmBoost = warmBoost + (cfg.activateTemp - temp) * 2200
+    end
+
+    targetInput = clamp(math.max(requiredForField + 50000, warmBoost), cfg.minInput, cfg.maxInput)
+
+    if cfg.autoActivate
+      and fPct >= cfg.activateField
+      and sPct >= cfg.activateSaturation
+      and temp >= cfg.activateTemp then
+      activateReactor()
+    end
+    return
+  end
+
+  if status == "running" then
+    state.runningTick = state.runningTick + 1
+
+    local fieldErr = cfg.targetField - fPct
+    local satErr = cfg.targetSaturation - sPct
+    local tempErr = cfg.targetTemp - temp
+
+    local inputBias = requiredForField
+    inputBias = inputBias + fieldErr * 180000
+    inputBias = inputBias + satErr * 50000
+    if temp > cfg.targetTemp then
+      inputBias = inputBias + (temp - cfg.targetTemp) * 3500
+    end
+    targetInput = clamp(inputBias, cfg.minInput, cfg.maxInput)
+
+    local reserve = requiredForField * 0.15 + 50000
+    local desiredOutput = currentOutput
+
+    if temp < cfg.targetTemp - 400 and sPct > cfg.minSaturation + 8 and fPct > cfg.minField + 8 then
+      desiredOutput = desiredOutput + cfg.outputRampPerTick * 1.6
+    elseif sPct > cfg.targetSaturation + 8 and fPct > cfg.targetField + 5 then
+      desiredOutput = desiredOutput + cfg.outputRampPerTick
+    elseif sPct < cfg.targetSaturation - 5 or fPct < cfg.targetField - 5 then
+      desiredOutput = desiredOutput - cfg.outputRampPerTick * 1.5
+    end
+
+    if temp > cfg.targetTemp + 150 then
+      desiredOutput = desiredOutput - cfg.outputRampPerTick * 2.0
+    end
+    if temp > cfg.maxTemp - 75 then
+      desiredOutput = math.min(desiredOutput, math.max(0, gen - reserve - 500000))
+    end
+    if sPct < cfg.minSaturation + 3 or fPct < cfg.minField + 3 then
+      desiredOutput = math.min(desiredOutput, math.max(0, gen - reserve - 250000))
+    end
+
+    desiredOutput = clamp(desiredOutput, cfg.minOutput, cfg.maxOutput)
+    targetOutput = desiredOutput
+    return
+  end
+
+  if status == "cooling" or status == "stopping" then
+    targetOutput = 0
+    targetInput = clamp(requiredForField, 0, cfg.maxInput)
+    return
+  end
+
+  targetOutput = 0
+  targetInput = clamp(requiredForField, 0, cfg.maxInput)
+end
+
+local function safetyChecks(info)
+  local status = reactorStatus(info)
+  local fPct = fieldPct(info)
+  local sPct = satPct(info)
+  local temp = tonumber(info.temperature or 0)
+
+  if status == "running" then
+    if fPct < cfg.minField then
+      scram("field below min")
+      return
+    end
+    if sPct < cfg.minSaturation then
+      scram("saturation below min")
+      return
+    end
+    if temp > cfg.maxTemp then
+      scram("temperature above max")
+      return
     end
   end
 
-  allowedOut = clamp(allowedOut, 0, CONFIG.maxOutput)
+  if state.lastFieldPct and status == "running" then
+    if fPct < state.lastFieldPct - 2.0 and currentInput >= (cfg.maxInput * 0.9) then
+      state.fieldDropTicks = state.fieldDropTicks + 1
+    else
+      state.fieldDropTicks = 0
+    end
 
-  local outRampUp = CONFIG.outputRampUp
-  if math.min(fField, rawField) > (CONFIG.targetField + 12) and rawSat > (CONFIG.targetSaturation + 8) and rawTemp >= (CONFIG.targetTemp - 250) then
-    outRampUp = CONFIG.outputRampUp * 2
+    if sPct < state.lastSatPct - 3.0 and currentOutput > 0 and currentInput >= (cfg.maxInput * 0.5) then
+      state.satDropTicks = state.satDropTicks + 1
+    else
+      state.satDropTicks = 0
+    end
+
+    if temp > cfg.maxTemp - 50 then
+      state.overTempTicks = state.overTempTicks + 1
+    else
+      state.overTempTicks = 0
+    end
+
+    if state.fieldDropTicks >= 8 then
+      scram("field collapsing / input locked?")
+      return
+    end
+    if state.satDropTicks >= 8 then
+      scram("saturation collapsing")
+      return
+    end
+    if state.overTempTicks >= 10 then
+      scram("persistent overtemp")
+      return
+    end
   end
-  if math.min(fField, rawField) < (CONFIG.targetField + 4) or fieldDelta < -0.5 then
-    outRampUp = math.max(200000, CONFIG.outputRampUp * 0.25)
+
+  state.lastFieldPct = fPct
+  state.lastSatPct = sPct
+  state.lastTemp = temp
+
+  if state.gateWriteFailures >= 6 then
+    inputGate = wrapPeripheral(cfg.inputGateName, "flow_gate")
+    outputGate = wrapPeripheral(cfg.outputGateName, "flow_gate")
+    if not inputGate or not outputGate then
+      scram("lost gate peripheral")
+      return
+    end
   end
-
-  local wantOut = slew(state.lastOutput, allowedOut, outRampUp, CONFIG.outputRampDown)
-
-  gateSet(gateIn, clamp(wantIn, 0, CONFIG.maxInput))
-  gateSet(gateOut, clamp(wantOut, 0, CONFIG.maxOutput))
-
-  state.lastInput = wantIn
-  state.lastOutput = wantOut
-  state.mode = state.fieldRecovery and "recover" or "run"
-
-  setStatus(
-    ("Run | T:%d F:%.1f/%.1f S:%.1f/%.1f dF:%.2f Goal:%s Out:%s"):format(
-      rawTemp, rawField, fField, rawSat, fSat, fieldDelta, fmtInt(targetOut), fmtInt(wantOut)
-    ),
-    state.fieldRecovery and colors.orange or colors.lime
-  )
 end
 
 local function applyControl(info)
-  processOperatorRequests(info)
-  if emergencyCheck(info) then return end
-
-  updateFiltered(info)
-  local status = info.status
-  local fup = fuelPct(info)
-
-  if state.lowFuelLatch and fup > (CONFIG.fuelSafeShutdown + 5) and (status == "cold" or status == "cooling") then
-    state.lowFuelLatch = false
-    uiDirty = true
-    setStatus("Fuel latch cleared", colors.lime)
+  if cfg.mode == "auto" then
+    updateAutoTargets(info)
+  else
+    targetInput = clamp(cfg.manualInput, cfg.minInput, cfg.maxInput)
+    targetOutput = clamp(cfg.manualOutput, cfg.minOutput, cfg.maxOutput)
   end
 
-  if not state.autoEnabled then
-    setStatus("Auto paused", colors.orange)
-    return
-  end
+  local newInput = smoothStep(currentInput, targetInput, cfg.inputRampPerTick)
+  local newOutput = smoothStep(currentOutput, targetOutput, cfg.outputRampPerTick)
 
-  if state.mode == "priming" then applyPrimingControl(info); return end
-
-  if status == "cold" then
-    gateSet(gateIn, 0); gateSet(gateOut, 0)
-    state.lastInput = 0; state.lastOutput = 0; state.readyToActivate = false
-    state.startupSince = nil; state.bleedSince = nil; state.primeUntil = nil
-    state.fieldRecovery = false
-    state.filtField = nil; state.filtSat = nil; state.filtTemp = nil; state.prevFiltField = nil; state.prevFiltSat = nil
-    state.mode = "idle"; uiDirty = true
-    if state.safeStopLatch then setStatus("Reactor offline (safe stop)", colors.orange)
-    else setStatus("Reactor offline", colors.lightGray) end
-    return
-  end
-
-  if isWarmupStatus(status) then applyChargingControl(info); return end
-
-  if status == "stopping" or status == "cooling" then
-    state.readyToActivate = false
-    state.mode = (status == "stopping") and "stopping" or "cooling"
-    state.fieldRecovery = false
-    uiDirty = true
-    applyCoolingControl(info)
-    return
-  end
-
-  if isRunningStatus(status) then
-    if state.mode == "startup_hold" then applyStartupHoldControl(info); return end
-    if state.mode == "startup_bleed" then applyStartupBleedControl(info); return end
-    if state.startupSince ~= nil and state.mode ~= "run" and state.mode ~= "recover" then applyStartupHoldControl(info); return end
-    applyRunControl(info)
-    return
-  end
-
-  state.readyToActivate = false
-  state.mode = "idle"
-  state.fieldRecovery = false
-  uiDirty = true
-  setStatus("Unhandled status: " .. tostring(status), colors.orange)
+  writeGate(inputGate, newInput, "input")
+  writeGate(outputGate, newOutput, "output")
 end
 
-local function controlLoop()
-  while running do
-    local now = os.clock()
-    local dt = now - state.lastLoopTime
-    if dt <= 0 then dt = CONFIG.controlRate end
-    state.lastLoopTime = now
+local function drawMain(info)
+  ui.buttons = {}
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
 
-    local info = getInfo()
-    lastInfo = info
-    if not info then
-      setStatus("No reactor info", colors.red)
-      gateSet(gateOut, 0); gateSet(gateIn, 0)
-      state.lastInput = 0; state.lastOutput = 0
-    else
-      applyControl(info)
+  drawBox(1, 1, monW, monH, colors.gray, colors.black)
+  text(3, 1, " Draconic Reactor Ctrl v" .. VERSION .. " ", colors.white, colors.gray)
+
+  local status = reactorStatus(info)
+  local fPct = round(fieldPct(info), 1)
+  local sPct = round(satPct(info), 1)
+  local temp = tonumber(info.temperature or 0)
+  local fuel = round(fuelPct(info), 1)
+  local gen = tonumber(info.generationRate or 0)
+  local drain = tonumber(info.fieldDrainRate or 0)
+
+  text(3, 3, "Status: " .. status, statusColor(status))
+  text(3, 4, "Mode:   " .. tostring(cfg.mode), cfg.mode == "auto" and colors.lime or colors.yellow)
+  text(3, 5, "Gen:    " .. fmtInt(gen) .. " FE/t", colors.white)
+  text(3, 6, "Drain:  " .. fmtInt(drain) .. " FE/t", colors.white)
+
+  text(3, 8, "Temperature: " .. fmtInt(temp) .. " C", tempColor(temp))
+  bar(3, 9, monW - 6, math.min(temp, cfg.maxTemp), cfg.maxTemp, tempColor(temp), colors.gray)
+
+  text(3, 11, "Field:       " .. tostring(fPct) .. "%", fieldColor(fPct))
+  bar(3, 12, monW - 6, fPct, 100, fieldColor(fPct), colors.gray)
+
+  text(3, 14, "Saturation:  " .. tostring(sPct) .. "%", satColor(sPct))
+  bar(3, 15, monW - 6, sPct, 100, satColor(sPct), colors.gray)
+
+  text(3, 17, "Fuel left:   " .. tostring(fuel) .. "%", fuel > 25 and colors.lime or colors.yellow)
+
+  text(3, 19, "Input gate:  " .. fmtInt(currentInput), colors.cyan)
+  text(3, 20, "Output gate: " .. fmtInt(currentOutput), colors.cyan)
+
+  text(3, 22, "Auto target in/out: " .. fmtInt(targetInput) .. " / " .. fmtInt(targetOutput), colors.lightBlue)
+  clearLine(monH - 1)
+  text(3, monH - 1, "Msg: " .. tostring(ui.message), colors.white)
+
+  addButton("charge",   3, 24, 12, 26, "CHARGE", function() chargeReactor() end, colors.blue)
+  addButton("activate", 14, 24, 25, 26, "ACTIVATE", function() activateReactor() end, colors.green)
+  addButton("scram",   27, 24, 36, 26, "SCRAM", function() scram("manual button") end, colors.red)
+  addButton("tuning",   3, 28, 14, 30, "TUNING", function() ui.screen = "tuning" end, colors.purple)
+  addButton("mode",    16, 28, 28, 30, cfg.mode == "auto" and "SET MANUAL" or "SET AUTO", function()
+    cfg.mode = (cfg.mode == "auto") and "manual" or "auto"
+    saveConfig()
+    setMessage("Mode -> " .. cfg.mode)
+  end, colors.brown)
+
+  for _, btn in ipairs(ui.buttons) do drawButton(btn) end
+end
+
+local function drawTuning(info)
+  ui.buttons = {}
+  mon.setBackgroundColor(colors.black)
+  mon.clear()
+  drawBox(1, 1, monW, monH, colors.gray, colors.black)
+  text(3, 1, " Tuning ", colors.white, colors.gray)
+  text(3, 3, "Mode: " .. cfg.mode, cfg.mode == "auto" and colors.lime or colors.yellow)
+
+  local row = 5
+  addParamButtons("targetField",      "Target Field %", row, 1, 5, 20, 80); row = row + 4
+  addParamButtons("minField",         "Min Field %", row,    1, 5, 5, 60); row = row + 4
+  addParamButtons("targetSaturation", "Target Sat %", row,   1, 5, 10, 90); row = row + 4
+  addParamButtons("minSaturation",    "Min Sat %", row,      1, 5, 5, 50); row = row + 4
+
+  if monH >= row + 8 then
+    addParamButtons("targetTemp", "Target Temp", row, 50, 250, 3000, 7900); row = row + 4
+    addParamButtons("maxTemp",    "Max Temp", row,    50, 250, 5000, 7990); row = row + 4
+  end
+
+  if monH >= row + 4 then
+    text(3, row, "Manual Input", colors.white)
+    text(monW - 16, row, fmtInt(cfg.manualInput), colors.cyan)
+    addButton("mi_dec", 3, row + 1, 10, row + 2, "-250k", function()
+      cfg.manualInput = clamp(cfg.manualInput - 250000, cfg.minInput, cfg.maxInput)
+      saveConfig()
+    end, colors.red)
+    addButton("mi_inc", 12, row + 1, 19, row + 2, "+250k", function()
+      cfg.manualInput = clamp(cfg.manualInput + 250000, cfg.minInput, cfg.maxInput)
+      saveConfig()
+    end, colors.green)
+
+    text(22, row, "Manual Output", colors.white)
+    text(monW - 16, row + 3, fmtInt(cfg.manualOutput), colors.cyan)
+    addButton("mo_dec", 22, row + 1, 30, row + 2, "-250k", function()
+      cfg.manualOutput = clamp(cfg.manualOutput - 250000, cfg.minOutput, cfg.maxOutput)
+      saveConfig()
+    end, colors.red)
+    addButton("mo_inc", 32, row + 1, 40, row + 2, "+250k", function()
+      cfg.manualOutput = clamp(cfg.manualOutput + 250000, cfg.minOutput, cfg.maxOutput)
+      saveConfig()
+    end, colors.green)
+    row = row + 5
+  end
+
+  addButton("back", 3, monH - 3, 12, monH - 2, "BACK", function() ui.screen = "main" end, colors.blue)
+  addButton("autoAct", 14, monH - 3, 27, monH - 2,
+    cfg.autoActivate and "AUTO ACT: ON" or "AUTO ACT: OFF",
+    function()
+      cfg.autoActivate = not cfg.autoActivate
+      saveConfig()
+    end,
+    cfg.autoActivate and colors.green or colors.red
+  )
+
+  for _, btn in ipairs(ui.buttons) do drawButton(btn) end
+  clearLine(monH - 1)
+  text(3, monH - 1, "Field/Sat/Temp manual targets are saved instantly.", colors.white)
+end
+
+local function redraw(info)
+  if ui.screen == "tuning" then
+    drawTuning(info)
+  else
+    drawMain(info)
+  end
+end
+
+local function handleTouch(side, x, y)
+  for _, btn in ipairs(ui.buttons) do
+    if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
+      btn.callback()
+      return
     end
-    sleep(CONFIG.controlRate)
   end
 end
 
 local function uiLoop()
-  local lastSnapshot = ""
-  while running do
-    local info = lastInfo
-    local snapshot = table.concat({
-      uiPage, state.mode, state.statusMsg, tostring(state.statusColor), tostring(state.autoEnabled),
-      tostring(CONFIG.targetOutput), tostring(CONFIG.targetTemp), tostring(CONFIG.targetField), tostring(CONFIG.targetSaturation),
-      tostring(state.fieldRecovery),
-      info and tostring(math.floor(info.temperature or 0)) or "nil",
-      info and tostring(math.floor((info.generationRate or 0) / 1000)) or "nil",
-      info and tostring(math.floor((fieldPct(info) or 0) * 10)) or "nil",
-      info and tostring(math.floor((saturationPct(info) or 0) * 10)) or "nil",
-      tostring(math.floor(gateGet(gateIn) or 0)), tostring(math.floor(gateGet(gateOut) or 0))
-    }, "|")
+  while true do
+    local info = state.lastInfo or getInfo() or {
+      status = "unknown",
+      temperature = 0,
+      fieldStrength = 0,
+      maxFieldStrength = 1,
+      energySaturation = 0,
+      maxEnergySaturation = 1,
+      fuelConversion = 0,
+      maxFuelConversion = 1,
+      generationRate = 0,
+      fieldDrainRate = 0
+    }
+    redraw(info)
+    sleep(0.2)
+  end
+end
 
-    if uiDirty or snapshot ~= lastSnapshot or state.redrawQueued then
-      redraw(state.redrawQueued)
-      lastSnapshot = snapshot
-      uiDirty = false
-      state.redrawQueued = false
+local function controlLoop()
+  while true do
+    local info = getInfo()
+    if not info then
+      state.staleInfoCount = state.staleInfoCount + 1
+      setMessage("No reactor info; retrying...")
+      if state.staleInfoCount >= 10 then
+        scram("reactor info stale")
+        detectPeripherals()
+      end
+      sleep(0.2)
+    else
+      state.staleInfoCount = 0
+      state.lastInfo = info
+      safetyChecks(info)
+      applyControl(info)
+      sleep(0.2)
     end
-    sleep(CONFIG.uiRate)
   end
 end
 
 local function eventLoop()
-  while running do
-    local e = { os.pullEvent() }
-    if e[1] == "monitor_touch" then
-      handleTouch(e[2], e[3], e[4])
-    elseif e[1] == "monitor_resize" then
-      pcall(monitor.setTextScale, CONFIG.monitorScale)
-      monW, monH = monitor.getSize()
-      requestFullRedraw()
-    elseif e[1] == "terminate" then
-      running = false
-      gateSet(gateOut, 0)
-      error("Terminated")
+  while true do
+    local e, p1, p2, p3 = os.pullEvent()
+    if e == "monitor_touch" then
+      handleTouch(p1, p2, p3)
+    elseif e == "peripheral" or e == "peripheral_detach" then
+      detectPeripherals()
+      setMessage("Peripherals refreshed")
+    elseif e == "char" then
+      if p1 == "q" or p1 == "Q" then
+        scram("keyboard quit")
+      end
     end
   end
 end
 
-term.clear()
-term.setCursorPos(1, 1)
-print(CONFIG.appName .. " v" .. CONFIG.version)
-print("Initializing peripherals...")
+ensureSetup()
+setMessage("Ready")
+if not loadConfig() then saveConfig() end
 
-initPeripherals()
-
-print(" Reactor: " .. CONFIG.reactorName)
-print(" Input:   " .. CONFIG.inputGateName)
-print(" Output:  " .. CONFIG.outputGateName)
-print(" Monitor: " .. monName)
-print("")
-print("Ready.")
-
-setStatus("System ready", colors.lime)
-redraw(true)
-parallel.waitForAny(controlLoop, uiLoop, eventLoop)
+parallel.waitForAny(uiLoop, controlLoop, eventLoop)
