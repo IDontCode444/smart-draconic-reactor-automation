@@ -133,6 +133,7 @@ local CONFIG = {
   adaptiveLearningRate       = 0.25,    -- how fast self-scaling tracks a larger reactor
   adaptiveDecay              = 0.998,   -- slow decay so scaling remains stable once learned
   forcedDriveMinFactor       = 0.05,    -- minimum cold-drive factor before forced output engages
+  targetSatDrainPerTick      = 0.15,    -- desired filtered saturation drop per control tick during cold drive
   forcedDriveDecay           = 0.92,    -- decay for forced output when the reactor is no longer cold/overfilled
   adaptivePIDRate            = 0.05,    -- how quickly the live PID multipliers adapt
 
@@ -190,6 +191,7 @@ local state = {
   filtSat   = nil,
   filtTemp  = nil,
   prevFiltField = nil,
+  prevFiltSat = nil,
 
   fieldRecovery = false,
   fieldDipCount = 0,
@@ -551,6 +553,7 @@ local function updateFiltered(info)
   local rawTemp  = info.temperature or 0
 
   state.prevFiltField = state.filtField
+  state.prevFiltSat = state.filtSat
   state.filtField = lerp(state.filtField, rawField, CONFIG.filterAlphaField)
   state.filtSat   = lerp(state.filtSat, rawSat, CONFIG.filterAlphaSat)
   state.filtTemp  = lerp(state.filtTemp, rawTemp, CONFIG.filterAlphaTemp)
@@ -1260,6 +1263,8 @@ local function applyRunControl(info, dt)
   local fSat = state.filtSat or rawSat
   local fTemp = state.filtTemp or rawTemp
   local prevField = state.prevFiltField or fField
+  local prevSat = state.prevFiltSat or fSat
+  local satDelta = fSat - prevSat
   local fup = fuelPct(info)
   local gen = info.generationRate or 0
   local gScale = gainScale()
@@ -1345,6 +1350,9 @@ local function applyRunControl(info, dt)
   local tempFactor = clamp((CONFIG.targetTemp - fTemp) / math.max(CONFIG.targetTemp, 1), 0, 1)
   local satFactor = clamp((fSat - CONFIG.targetSaturation) / 50, 0, 1)
   local driveFactor = tempFactor * satFactor
+  local actualDrain = math.max(0, -satDelta)
+  local targetDrainRate = CONFIG.targetSatDrainPerTick or 0.15
+  local drainError = math.max(0, targetDrainRate - actualDrain)
 
   local maxAllowedOut = baseAllowedOut
   if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > recoverExit then
@@ -1352,49 +1360,40 @@ local function applyRunControl(info, dt)
   end
 
   local dynamicCap =
-    (gen * (1.05 + driveFactor * 0.55)) +
-    ((info.maxEnergySaturation or 0) * (0.00000010 + driveFactor * 0.00000022))
+    (gen * (1.08 + driveFactor * 0.40 + drainError * 2.20)) +
+    ((info.maxEnergySaturation or 0) * (0.00000006 + driveFactor * 0.00000012 + drainError * 0.00000055))
   maxAllowedOut = math.max(maxAllowedOut, dynamicCap)
   maxAllowedOut = clamp(maxAllowedOut, 0, math.min(CONFIG.maxOutput, CONFIG.outputHeatCapMax))
 
-  local biasBase = (state.outputBias * 0.92) + outSatTrim + outTempTrim
+  local biasBase = (state.outputBias * 0.90) + outSatTrim + outTempTrim
   local biasTarget = biasBase
 
   local forcedDemand = 0
-  if driveFactor > (CONFIG.forcedDriveMinFactor or 0.05) and fField > recoverExit then
-    forcedDemand =
-      (gen * (0.85 + driveFactor * 0.55)) +
-      (satSurplus * scaleValue(0.020, 80000, 240000)) +
-      (tempDeficit * scaleValue(0.00010, 90, 1200))
-  elseif fField > fieldSoftBand and satSurplus > 8 and tempDeficit > 400 then
-    forcedDemand =
-      (gen * 0.70) +
-      (satSurplus * scaleValue(0.012, 50000, 160000)) +
-      (tempDeficit * scaleValue(0.00006, 60, 700))
+  if drainError > 0 and driveFactor > (CONFIG.forcedDriveMinFactor or 0.05) and fField > recoverExit then
+    forcedDemand = drainError * (
+      (gen * 2.0) +
+      ((info.maxEnergySaturation or 0) * 0.0000010) +
+      scaleValue(0.10, 500000, 4000000)
+    )
+  elseif drainError > 0 and fField > fieldSoftBand and satSurplus > 8 and tempDeficit > 400 then
+    forcedDemand = drainError * (
+      (gen * 1.3) +
+      ((info.maxEnergySaturation or 0) * 0.00000065)
+    )
   end
 
   if forcedDemand > 0 then
     state.driveBias = slew(state.driveBias or 0, math.min(maxAllowedOut, forcedDemand), biasUp, biasDown)
   else
-    state.driveBias = slew(state.driveBias or 0, 0, biasDown, math.max(biasDownFast, biasDown))
+    state.driveBias = slew(state.driveBias or 0, 0, math.max(biasDownFast, biasDown), math.max(biasDownFast, biasDown))
   end
 
   biasTarget = math.max(biasTarget, state.driveBias or 0)
 
-  if fieldHeadroom >= 10 and satSurplus >= 15 then
-    biasTarget = math.max(biasTarget, gen * 0.34)
-  elseif fieldHeadroom >= 6 and satSurplus >= 8 then
-    biasTarget = math.max(biasTarget, gen * 0.26)
-  elseif fieldHeadroom >= 3 then
-    biasTarget = math.max(biasTarget, gen * 0.20)
-  end
-
-  if forcedDemand <= 0 and fField > fieldSoftBand and satSurplus > 10 then
-    local warmupFloor =
-      gen * 0.90 +
-      (satSurplus * scaleValue(0.006, 40000, 120000)) +
-      (tempDeficit * scaleValue(0.00005, 60, 900))
-    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, warmupFloor))
+  if drainError <= 0 and fieldHeadroom >= 8 and satSurplus >= 10 then
+    biasTarget = math.max(biasTarget, gen * 0.18)
+  elseif drainError > 0 and fieldHeadroom >= 4 and satSurplus >= 6 then
+    biasTarget = math.max(biasTarget, gen * 0.24)
   end
 
   if state.justRecovered then
@@ -1454,8 +1453,8 @@ local function applyRunControl(info, dt)
   state.fieldDipCount = math.max((state.fieldDipCount or 0) - 1, 0)
 
   setStatus(
-    ("Run | T:%d F:%.1f/%.1f dF:%.1f dips:%d S:%.1f/%.1f Fuel:%.1f%% Out:%s Scale:%s AP:%.2f/%.2f"):format(
-      rawTemp, rawField, fField, fieldDelta, state.fieldDipCount or 0, rawSat, fSat, fup, fmtInt(wantOut), fmtInt(scale),
+("Run | T:%d F:%.1f/%.1f dF:%.1f dS:%.2f dips:%d S:%.1f/%.1f Fuel:%.1f%% Out:%s Scale:%s AP:%.2f/%.2f"):format(
+      rawTemp, rawField, fField, fieldDelta, actualDrain, state.fieldDipCount or 0, rawSat, fSat, fup, fmtInt(wantOut), fmtInt(scale),
       (state.pidAdapt and state.pidAdapt.outputSat and state.pidAdapt.outputSat.kp or 1),
       (state.pidAdapt and state.pidAdapt.outputTemp and state.pidAdapt.outputTemp.kp or 1)
     ),
@@ -1510,6 +1509,7 @@ local function applyControl(info, dt)
     state.filtSat = nil
     state.filtTemp = nil
     state.prevFiltField = nil
+    state.prevFiltSat = nil
     state.mode = "idle"
     uiDirty = true
 
