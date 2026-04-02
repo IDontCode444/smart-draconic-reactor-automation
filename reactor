@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "9.5",
+  version      = "9.6",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -1389,6 +1389,24 @@ local function applyRunControl(info, dt)
     forcedDemand = gen * 0.72
   end
 
+  local cold = fTemp < (CONFIG.targetTemp - 2000)
+  local overfull = fSat > (CONFIG.targetSaturation + 20)
+  local strongField = math.min(rawField, fField) > (CONFIG.targetField + 10)
+  local safeFieldMotion = rawFieldDelta >= -0.08 and fieldDelta >= -0.08
+
+  if cold and overfull and strongField and safeFieldMotion then
+    local forcedColdOutput =
+      gen +
+      ((info.maxEnergySaturation or 0) * 0.0000009) +
+      (drain * 1.8)
+
+    forcedDemand = math.max(forcedDemand, forcedColdOutput)
+  end
+
+  if gen <= 0 and fSat > 90 and strongField and rawFieldDelta > -0.10 and fieldDelta > -0.10 then
+    forcedDemand = math.max(forcedDemand, 2000000)
+  end
+
   if forcedDemand > 0 then
     state.driveBias = slew(state.driveBias or 0, math.min(maxAllowedOut, forcedDemand), biasUp, biasDown)
   else
@@ -1453,6 +1471,10 @@ local function applyRunControl(info, dt)
   local outputRampUp = math.max(CONFIG.outputRampUp, scaleValue(0.010, 250000, 1000000))
   local outputRampDown = math.max(CONFIG.outputRampDown, scaleValue(0.110, 5000000, 22000000))
   local dynamicRampUp = outputRampUp
+
+  if cold and strongField and rawFieldDelta >= -0.08 and fieldDelta >= -0.08 then
+    dynamicRampUp = math.max(dynamicRampUp, outputRampUp * 2.5)
+  end
 
   if rawFieldDelta < -0.60 or fieldDelta < -0.50 then
     dynamicRampUp = math.max(120000, dynamicRampUp * 0.15)
