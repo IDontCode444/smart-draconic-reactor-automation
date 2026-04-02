@@ -103,13 +103,13 @@ local CONFIG = {
 
   -- Field protection and recovery
   fieldRecoverMarginEnter = 2,   -- enter recovery when filtered field drops this far below target
-  fieldRecoverMarginExit  = 6,   -- leave recovery after climbing this far above target
-  fieldSoftMargin         = 4,   -- start soft output limiting near target instead of far above it
-  fieldHardMargin         = -1,  -- hard clamp only when field actually falls below target
-  fieldDropTrip           = 8.0, -- require a larger filtered drop before tripping recovery
-  fieldTripSamples        = 3,   -- consecutive shaky samples before full recovery mode
-  satLowBand              = 42,
-  satSoftBand             = 48,
+  fieldRecoverMarginExit  = 3,   -- leave recovery after climbing this far above target
+  fieldSoftMargin         = 2,   -- start soft output limiting near target instead of far above it
+  fieldHardMargin         = -3,  -- hard clamp only when field actually falls below target
+  fieldDropTrip           = 4.0, -- require a larger filtered drop before tripping recovery
+  fieldTripSamples        = 2,   -- consecutive shaky samples before full recovery mode
+  satLowBand              = 40,
+  satSoftBand             = 45,
 
   ----------------------------------------------------------
   -- FLOW LIMITS
@@ -198,6 +198,8 @@ local state = {
   justRecovered = false,
   outputBias = 0,
   driveBias = 0,
+  redrawQueued = false,
+  recoverBoostUntil = 0,
 }
 
 --========================================================--
@@ -621,6 +623,12 @@ end
 --========================================================--
 -- LOW-FLICKER UI
 --========================================================--
+
+
+local function requestFullRedraw()
+  state.redrawQueued = true
+  uiDirty = true
+end
 
 local function clearButtons()
   buttons = {}
@@ -1288,10 +1296,19 @@ local function applyRunControl(info, dt)
 
   if severeFieldDip or (state.fieldDipCount or 0) >= CONFIG.fieldTripSamples then
     state.fieldRecovery = true
-  elseif state.fieldRecovery and fField > recoverExit and rawField > math.max(recoverExit - 1, CONFIG.targetField + 3) and fieldDelta >= -1.0 then
-    state.fieldRecovery = false
-    state.fieldDipCount = 0
-    state.justRecovered = true
+  elseif state.fieldRecovery then
+    local recoveredStable =
+      fField >= recoverExit
+      and rawField >= math.max(recoverExit - 2, CONFIG.targetField + 1)
+      and fieldDelta >= -0.6
+      and fSat >= (CONFIG.targetSaturation - 2)
+
+    if recoveredStable then
+      state.fieldRecovery = false
+      state.fieldDipCount = 0
+      state.justRecovered = true
+      state.recoverBoostUntil = os.clock() + 2.5
+    end
   end
 
   local holdFieldTarget = CONFIG.targetField + 8
@@ -1305,7 +1322,7 @@ local function applyRunControl(info, dt)
     wantIn = math.max(baseIn * 1.22, CONFIG.bleedInputFloor, baseIn + recoverExtra)
     wantIn = slew(state.lastInput, clamp(wantIn, 0, CONFIG.maxInput), CONFIG.inputRampUp, CONFIG.inputRampDown)
 
-    local keepOut = math.min(state.lastOutput * 0.35, gen * 0.08)
+    local keepOut = math.min(state.lastOutput * 0.55, gen * 0.12)
     if severeFieldDip or fField < fieldHardBand or fSat < CONFIG.satLowBand then
       keepOut = 0
     end
@@ -1396,29 +1413,32 @@ local function applyRunControl(info, dt)
     biasTarget = math.max(biasTarget, gen * 0.24)
   end
 
-  if state.justRecovered then
-    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, math.max(gen * 0.30, scaleValue(0.18, 900000, 5000000))))
+  if state.justRecovered or ((state.recoverBoostUntil or 0) > os.clock()) then
+    biasTarget = math.max(
+      biasTarget,
+      math.min(maxAllowedOut, math.max(gen * 0.42, scaleValue(0.22, 1500000, 7000000)))
+    )
   end
 
   if fField < fieldHardBand or fSat < CONFIG.satLowBand then
-    biasTarget = math.min(biasTarget, gen * 0.05)
+    biasTarget = math.min(biasTarget, gen * 0.08)
     wantIn = math.max(wantIn, baseIn * 1.22)
     state.driveBias = 0
   elseif fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
-    biasTarget = math.min(biasTarget, gen * 0.25)
+    biasTarget = math.min(biasTarget, gen * 0.40)
     wantIn = math.max(wantIn, baseIn * 1.12)
   end
 
   if fieldDelta < -2.0 then
-    biasTarget = math.min(biasTarget, gen * 0.15)
+    biasTarget = math.min(biasTarget, gen * 0.22)
     wantIn = math.max(wantIn, baseIn * 1.16)
   elseif fieldDelta < -1.0 then
-    biasTarget = math.min(biasTarget, gen * 0.25)
+    biasTarget = math.min(biasTarget, gen * 0.38)
     wantIn = math.max(wantIn, baseIn * 1.10)
   end
 
   if fTemp > CONFIG.targetTemp - 50 then
-    biasTarget = math.min(biasTarget, gen * 0.22)
+    biasTarget = math.min(biasTarget, gen * 0.30)
   end
 
   biasTarget = clamp(biasTarget, 0, maxAllowedOut)
@@ -1435,7 +1455,9 @@ local function applyRunControl(info, dt)
   end
 
   state.outputBias = slew(state.outputBias, biasTarget, biasStepUp, biasStepDownNow)
-  state.justRecovered = false
+  if (state.recoverBoostUntil or 0) <= os.clock() then
+    state.justRecovered = false
+  end
 
   local outputRampUp = math.max(CONFIG.outputRampUp, scaleValue(0.030, 350000, 4000000))
   local outputRampDown = math.max(CONFIG.outputRampDown, scaleValue(0.080, 2500000, 12000000))
