@@ -1,5 +1,5 @@
 -- Draconic Reactor Auto Controller for CC:Tweaked
--- ATM10 / Draconic Evolution reactor controller
+-- Revised version: fixes flux gate live-flow display
 --
 -- Named peripherals expected:
 --   reactor:     draconic_reactor_0
@@ -7,15 +7,6 @@
 --   output gate: flow_gate_1
 --
 -- Monitor is auto-detected.
---
--- UI:
---   Main screen: CHARGE / ACTIVATE / SCRAM / TUNING
---   Tuning screen: adjust Temp / Field / Saturation / Output targets
---
--- Notes:
--- - Buffered monitor rendering prevents flicker.
--- - Charging logic respects the reactor's 50% field + 50% saturation charge state.
--- - Output auto-regulates for highest stable output at lowest safe field input.
 
 -------------------------
 -- USER EDITABLE NAMES  --
@@ -33,10 +24,10 @@ local defaults = {
   monitorTextScale = 0.5,
 
   targets = {
-    temp   = 7800,        -- efficient target is near 8000C
-    field  = 45,          -- running target %
-    sat    = 25,          -- running target %
-    output = 10000000,    -- 10M rf/t default cap
+    temp   = 7800,
+    field  = 45,
+    sat    = 25,
+    output = 10000000,
   },
 
   limits = {
@@ -75,7 +66,6 @@ local state = {
   running = true,
   scrammed = false,
   message = "Booting...",
-  lastTouch = 0,
 }
 
 -------------------------
@@ -236,13 +226,17 @@ end
 -------------------------
 -- GATE COMPAT LAYER   --
 -------------------------
+-- IMPORTANT:
+-- getFlow() = live current transfer
+-- other getters are often config/override values
+
 local function setGateFlow(gate, value)
   value = math.max(0, round(tonumber(value) or 0))
 
-  if hasMethod(gate, "setSignalLowFlow") then
-    return gate.setSignalLowFlow(value)
-  elseif hasMethod(gate, "setFlowOverride") then
+  if hasMethod(gate, "setFlowOverride") then
     return gate.setFlowOverride(value)
+  elseif hasMethod(gate, "setSignalLowFlow") then
+    return gate.setSignalLowFlow(value)
   elseif hasMethod(gate, "setFlow") then
     return gate.setFlow(value)
   else
@@ -250,13 +244,25 @@ local function setGateFlow(gate, value)
   end
 end
 
-local function getGateFlow(gate)
-  if hasMethod(gate, "getSignalLowFlow") then
-    return tonumber(gate.getSignalLowFlow()) or 0
-  elseif hasMethod(gate, "getFlowOverride") then
+local function getGateFlowSetpoint(gate)
+  if hasMethod(gate, "getFlowOverride") then
     return tonumber(gate.getFlowOverride()) or 0
+  elseif hasMethod(gate, "getSignalLowFlow") then
+    return tonumber(gate.getSignalLowFlow()) or 0
   elseif hasMethod(gate, "getFlow") then
     return tonumber(gate.getFlow()) or 0
+  else
+    return 0
+  end
+end
+
+local function getGateLiveFlow(gate)
+  if hasMethod(gate, "getFlow") then
+    return tonumber(gate.getFlow()) or 0
+  elseif hasMethod(gate, "getFlowOverride") then
+    return tonumber(gate.getFlowOverride()) or 0
+  elseif hasMethod(gate, "getSignalLowFlow") then
+    return tonumber(gate.getSignalLowFlow()) or 0
   else
     return 0
   end
@@ -386,7 +392,7 @@ local function calcWantedInput(info)
   return math.max(0, wanted)
 end
 
-local function calcWantedOutput(info, currentOut)
+local function calcWantedOutput(info, currentSetpoint)
   local targetTemp = clamp(settings.targets.temp, 2500, 8000)
   local targetSat = clamp(settings.targets.sat, 5, 95)
   local maxOut = math.max(0, settings.targets.output)
@@ -416,14 +422,14 @@ local function calcWantedOutput(info, currentOut)
 
   local step = math.max(
     settings.control.outputStepMin,
-    math.min(settings.control.outputStepMax, math.max(100000, currentOut * settings.control.outputRampFraction))
+    math.min(settings.control.outputStepMax, math.max(100000, currentSetpoint * settings.control.outputRampFraction))
   )
 
-  local wanted = currentOut + (score * step)
+  local wanted = currentSetpoint + (score * step)
   wanted = clamp(wanted, 0, maxOut)
 
   if info.fieldPct < minFieldThrottle or info.satPct < settings.limits.minSatThrottle or info.temperature > settings.limits.maxTempThrottle then
-    wanted = math.min(wanted, currentOut * 0.70, info.generationRate * 1.05)
+    wanted = math.min(wanted, currentSetpoint * 0.70, info.generationRate * 1.05)
   end
 
   if info.temperature < 2200 then
@@ -439,7 +445,7 @@ local function hardScram(info, why)
   pcall(reactorStop)
 
   local inFlow = calcWantedInput(info)
-  local outFlow = math.max(getGateFlow(outputGate), info.generationRate)
+  local outFlow = math.max(getGateFlowSetpoint(outputGate), info.generationRate)
 
   pcall(setGateFlow, inputGate, inFlow)
   pcall(setGateFlow, outputGate, outFlow)
@@ -475,8 +481,8 @@ local function controlTick()
     return
   end
 
-  local currentIn = getGateFlow(inputGate)
-  local currentOut = getGateFlow(outputGate)
+  local currentInSetpoint = getGateFlowSetpoint(inputGate)
+  local currentOutSetpoint = getGateFlowSetpoint(outputGate)
 
   if state.scrammed then
     if isColdLike(info.status) then
@@ -485,7 +491,7 @@ local function controlTick()
       state.message = "SCRAM complete - reactor cold"
     else
       local inFlow = calcWantedInput(info)
-      local outFlow = math.max(currentOut, info.generationRate)
+      local outFlow = math.max(currentOutSetpoint, info.generationRate)
       pcall(setGateFlow, inputGate, inFlow)
       pcall(setGateFlow, outputGate, outFlow)
       state.message = "SCRAM cooling sequence active"
@@ -500,9 +506,8 @@ local function controlTick()
     return
   end
 
-  -- Charging phase: field and saturation only need 50%
   if isChargingLike(info.status) and not isRunningLike(info.status) then
-    local chargeReady = (info.fieldPct >= 50) and (info.satPct >= 50)
+    local chargeReady = (info.fieldPct >= 50) and (info.satPct >= 50) and (info.temperature >= 2000)
 
     if chargeReady then
       pcall(setGateFlow, inputGate, 0)
@@ -511,14 +516,14 @@ local function controlTick()
     else
       pcall(setGateFlow, outputGate, 0)
       pcall(setGateFlow, inputGate, settings.control.chargeFlow)
-      state.message = "Charging reactor (need 50% field/sat)"
+      state.message = "Charging reactor (need 50% field/sat and 2000C)"
     end
     return
   end
 
   if isStoppingLike(info.status) then
     local inFlow = calcWantedInput(info)
-    local outFlow = math.max(info.generationRate, currentOut)
+    local outFlow = math.max(info.generationRate, currentOutSetpoint)
     pcall(setGateFlow, inputGate, inFlow)
     pcall(setGateFlow, outputGate, outFlow)
     state.message = "Controlled shutdown"
@@ -527,7 +532,7 @@ local function controlTick()
 
   if isRunningLike(info.status) or info.status == "warming_up" then
     local wantedIn = calcWantedInput(info)
-    local wantedOut = calcWantedOutput(info, currentOut)
+    local wantedOut = calcWantedOutput(info, currentOutSetpoint)
 
     pcall(setGateFlow, inputGate, wantedIn)
     pcall(setGateFlow, outputGate, wantedOut)
@@ -623,8 +628,7 @@ end
 local function addButton(x, y, w, h, label, bg, fg, onPress)
   label = tostring(label)
   for yy = y, y + h - 1 do
-    local line = string.rep(" ", w)
-    writeAt(x, yy, line, fg, bg)
+    writeAt(x, yy, string.rep(" ", w), fg, bg)
   end
 
   local ly = y + math.floor((h - 1) / 2)
@@ -679,6 +683,9 @@ local function drawMainPage()
   writeAt(11, 3, status, colors.white, statColor)
 
   if info then
+    local inLive = getGateLiveFlow(inputGate)
+    local outLive = getGateLiveFlow(outputGate)
+
     writeAt(2, 5,  "Temp:", colors.lightGray, colors.black)
     writeAt(11, 5, tostring(round(info.temperature)) .. " C", colors.white, colors.black)
 
@@ -692,10 +699,10 @@ local function drawMainPage()
     writeAt(11, 8, fmtRF(info.generationRate) .. "rf/t", colors.white, colors.black)
 
     writeAt(2, 9,  "In:", colors.lightGray, colors.black)
-    writeAt(11, 9, fmtRF(getGateFlow(inputGate)) .. "rf/t", colors.white, colors.black)
+    writeAt(11, 9, fmtRF(inLive) .. "rf/t", colors.white, colors.black)
 
     writeAt(2, 10, "Out:", colors.lightGray, colors.black)
-    writeAt(11,10, fmtRF(getGateFlow(outputGate)) .. "rf/t", colors.white, colors.black)
+    writeAt(11,10, fmtRF(outLive) .. "rf/t", colors.white, colors.black)
 
     local barW = math.max(10, w - 24)
     drawHBar(22, 5, barW, clamp(info.temperature / math.max(settings.limits.maxTempScram, 1) * 100, 0, 100), colors.red, colors.gray, "TEMP")
@@ -775,7 +782,7 @@ local function drawTunePage()
 
   writeAt(1, 1, centerText(w, "TUNING"), colors.white, colors.blue)
   writeAt(2, 3, "Adjust reactor targets.", colors.white, colors.black)
-  writeAt(2, 4, "Output target now supports multi-million and 100M jumps.", colors.lightGray, colors.black)
+  writeAt(2, 4, "Output target supports large jumps up to 10B rf/t.", colors.lightGray, colors.black)
 
   drawTuneRow(6, "Temp Target (C)", settings.targets.temp, {
     { label = "-50", fn = function() adjustSetting("targets", "temp", -50, 2500, 8000) end },
@@ -872,15 +879,7 @@ local function eventLoop()
   while state.running do
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "monitor_touch" then
-      local touchedName = p1
-      local x = p2
-      local y = p3
-
-      if touchedName == monitorName or touchedName == peripheral.getName(monitor) then
-        handleTouch(x, y)
-      else
-        handleTouch(x, y)
-      end
+      handleTouch(p2, p3)
     elseif ev == "peripheral_detach" or ev == "peripheral" then
       local ok, err = pcall(function()
         initPeripherals()
@@ -900,9 +899,7 @@ local function main()
   loadSettings()
   initPeripherals()
   initScreen()
-
   state.message = "Ready"
-
   parallel.waitForAny(controlLoop, renderLoop, eventLoop)
 end
 
