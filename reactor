@@ -20,7 +20,7 @@ local CONFIG = {
   -- UI
   ----------------------------------------------------------
   appName      = "ATM10 Reactor Control",
-  version      = "9.6",
+  version      = "9.0",
   monitorScale = 0.5,
 
   ----------------------------------------------------------
@@ -90,26 +90,26 @@ local CONFIG = {
   ----------------------------------------------------------
   -- FILTERING / CONTROL SHAPE
   ----------------------------------------------------------
-  filterAlphaField = 0.18,
+  filterAlphaField = 0.08,
   filterAlphaSat   = 0.08,
   filterAlphaTemp  = 0.06,
 
   inputRampUp      = 4000000,
   inputRampDown    = 500000,
-  outputRampUp     = 500000,
+  outputRampUp     = 350000,
   outputRampDown   = 2500000,
 
   inputBaseFloorFactor = 1.15,
 
   -- Field protection and recovery
-  fieldRecoverMarginEnter = 6,   -- enter recovery earlier to maintain a stronger field reserve
-  fieldRecoverMarginExit  = 12,  -- require a healthier reserve before leaving recovery
-  fieldSoftMargin         = 10,  -- begin trimming output while field is still comfortably above target
-  fieldHardMargin         = 4,   -- hard clamp before the field gets close to the danger zone
-  fieldDropTrip           = 1.8, -- trip recovery on meaningful falling-field velocity
-  fieldTripSamples        = 2,   -- recover sooner when the field becomes unstable
-  satLowBand              = 46,
-  satSoftBand             = 54,
+  fieldRecoverMarginEnter = 2,   -- enter recovery when filtered field drops this far below target
+  fieldRecoverMarginExit  = 6,   -- leave recovery after climbing this far above target
+  fieldSoftMargin         = 4,   -- start soft output limiting near target instead of far above it
+  fieldHardMargin         = -1,  -- hard clamp only when field actually falls below target
+  fieldDropTrip           = 8.0, -- require a larger filtered drop before tripping recovery
+  fieldTripSamples        = 3,   -- consecutive shaky samples before full recovery mode
+  satLowBand              = 42,
+  satSoftBand             = 48,
 
   ----------------------------------------------------------
   -- FLOW LIMITS
@@ -123,19 +123,15 @@ local CONFIG = {
   outputBiasStepUpBase       = 500000,
   outputBiasStepDownBase     = 180000,
   outputBiasStepDownFast     = 650000,
-  outputBiasMaxFactorBase    = 0.92,   -- normal run output stays below generation until the field proves stable
-  outputBiasHeatPushFactor   = 1.18,   -- cooler reactors can push harder, but not enough to destabilize the field
+  outputBiasMaxFactorBase    = 0.78,   -- normal max output as fraction of generation before gain multiplier
+  outputBiasHeatPushFactor   = 0.92,   -- when reactor is cool but safe, allow more output push
   outputDemandPerSatPct      = 90000,  -- extra output demand per % saturation above target
   outputDemandPerTempC       = 180,    -- extra output demand per degree below target temp
   outputCapPerSatPct         = 120000, -- absolute cap growth per % saturation above target
   outputCapPerTempC          = 220,    -- absolute cap growth per degree below target temp
-  outputHeatCapMax           = 2147483000,-- practical ceiling; no artificial low output cap
+  outputHeatCapMax           = 18000000,-- hard cap for cold-drive pull while field is healthy
   adaptiveLearningRate       = 0.25,    -- how fast self-scaling tracks a larger reactor
   adaptiveDecay              = 0.998,   -- slow decay so scaling remains stable once learned
-  forcedDriveMinFactor       = 0.05,    -- minimum cold-drive factor before forced output engages
-  targetSatDrainPerTick      = 0.08,    -- slower cold drive reduces field oscillation
-  forcedDriveDecay           = 0.92,    -- decay for forced output when the reactor is no longer cold/overfilled
-  adaptivePIDRate            = 0.05,    -- how quickly the live PID multipliers adapt
 
   ----------------------------------------------------------
   -- PID TUNING
@@ -191,14 +187,12 @@ local state = {
   filtSat   = nil,
   filtTemp  = nil,
   prevFiltField = nil,
-  prevFiltSat = nil,
-  prevRawField = nil,
 
   fieldRecovery = false,
   fieldDipCount = 0,
   justRecovered = false,
   outputBias = 0,
-  driveBias = 0,
+  redrawQueued = false,
 }
 
 --========================================================--
@@ -272,9 +266,6 @@ end
 
 local function newPID(cfg)
   return {
-    baseKp = cfg.kp,
-    baseKi = cfg.ki,
-    baseKd = cfg.kd,
     kp = cfg.kp,
     ki = cfg.ki,
     kd = cfg.kd,
@@ -293,54 +284,6 @@ local function resetPIDs()
   pidInTemp  = newPID(CONFIG.pid.inputTemp)
   pidOutSat  = newPID(CONFIG.pid.outputSat)
   pidOutTemp = newPID(CONFIG.pid.outputTemp)
-  state.pidAdapt = {
-    outputSat = { kp = 1.0, ki = 1.0, kd = 1.0, lastSign = 0, lastAbsErr = 0, stableTicks = 0 },
-    outputTemp = { kp = 1.0, ki = 1.0, kd = 1.0, lastSign = 0, lastAbsErr = 0, stableTicks = 0 },
-  }
-end
-
-local function applyPIDAdaptive(pid, adapt)
-  if not pid or not adapt then return end
-  pid.kp = pid.baseKp * adapt.kp
-  pid.ki = pid.baseKi * adapt.ki
-  pid.kd = pid.baseKd * adapt.kd
-end
-
-local function adaptPIDChannel(pid, adapt, err, dt)
-  if not pid or not adapt then return end
-  dt = math.max(dt or 0.05, 0.01)
-  local absErr = math.abs(err)
-  local sign = 0
-  if err > 0.001 then sign = 1 elseif err < -0.001 then sign = -1 end
-  local lastSign = adapt.lastSign or 0
-  local improving = absErr < ((adapt.lastAbsErr or absErr) * 0.985)
-  local oscillating = sign ~= 0 and lastSign ~= 0 and sign ~= lastSign
-  local rate = CONFIG.adaptivePIDRate or 0.05
-
-  if oscillating then
-    adapt.kp = clamp(adapt.kp * (1.0 - rate * 0.8), 0.55, 1.70)
-    adapt.ki = clamp(adapt.ki * (1.0 - rate * 1.2), 0.35, 1.60)
-    adapt.kd = clamp(adapt.kd * (1.0 + rate * 0.9), 0.70, 2.20)
-    adapt.stableTicks = 0
-  elseif improving then
-    adapt.stableTicks = math.min((adapt.stableTicks or 0) + 1, 200)
-    if adapt.stableTicks > 3 then
-      adapt.kp = clamp(adapt.kp * (1.0 + rate * 0.18), 0.55, 1.70)
-      adapt.ki = clamp(adapt.ki * (1.0 + rate * 0.10), 0.35, 1.60)
-      adapt.kd = clamp(adapt.kd * (1.0 - rate * 0.10), 0.70, 2.20)
-    end
-  else
-    adapt.stableTicks = math.max((adapt.stableTicks or 0) - 1, 0)
-    if absErr > (adapt.lastAbsErr or absErr) * 1.02 then
-      adapt.kp = clamp(adapt.kp * (1.0 - rate * 0.30), 0.55, 1.70)
-      adapt.ki = clamp(adapt.ki * (1.0 - rate * 0.35), 0.35, 1.60)
-      adapt.kd = clamp(adapt.kd * (1.0 + rate * 0.30), 0.70, 2.20)
-    end
-  end
-
-  adapt.lastSign = sign
-  adapt.lastAbsErr = absErr
-  applyPIDAdaptive(pid, adapt)
 end
 
 local function pidUpdate(pid, err, dt)
@@ -554,8 +497,6 @@ local function updateFiltered(info)
   local rawTemp  = info.temperature or 0
 
   state.prevFiltField = state.filtField
-  state.prevFiltSat = state.filtSat
-  state.prevRawField = rawField
   state.filtField = lerp(state.filtField, rawField, CONFIG.filterAlphaField)
   state.filtSat   = lerp(state.filtSat, rawSat, CONFIG.filterAlphaSat)
   state.filtTemp  = lerp(state.filtTemp, rawTemp, CONFIG.filterAlphaTemp)
@@ -577,6 +518,13 @@ local function fieldHardThreshold()
   return clamp(CONFIG.targetField + CONFIG.fieldHardMargin, 10, 90)
 end
 
+local function requestFullRedraw()
+  lastStaticPage = nil
+  uiDirty = true
+  state.redrawQueued = true
+end
+
+
 local function adaptiveScaleNow()
   return math.max(state.adaptiveScale or 1000000, 1000000)
 end
@@ -584,36 +532,23 @@ end
 local function updateAdaptiveScale(info)
   local gen = math.max(0, info.generationRate or 0)
   local drain = math.max(0, info.fieldDrainRate or 0)
-  local temp = math.max(0, info.temperature or 0)
-  local sat = saturationPct(info)
 
   local learn = CONFIG.adaptiveLearningRate or 0.25
   local decay = CONFIG.adaptiveDecay or 0.998
 
-  -- Do not "learn" from a deliberately over-driven cold reactor. That inflates the
-  -- scale and can keep output pinned much longer than intended.
-  local learnAllowed =
-    temp >= (CONFIG.targetTemp * 0.45)
-    or sat <= (CONFIG.targetSaturation + 20)
-
-  if learnAllowed then
-    state.adaptiveGenPeak = math.max(gen, (state.adaptiveGenPeak or gen) * decay)
-    state.adaptiveDrainPeak = math.max(drain, (state.adaptiveDrainPeak or drain) * decay)
-  else
-    state.adaptiveGenPeak = math.max(1000000, (state.adaptiveGenPeak or 1000000) * decay)
-    state.adaptiveDrainPeak = math.max(1000000, (state.adaptiveDrainPeak or 1000000) * decay)
-  end
+  state.adaptiveGenPeak = math.max(gen, (state.adaptiveGenPeak or gen) * decay)
+  state.adaptiveDrainPeak = math.max(drain, (state.adaptiveDrainPeak or drain) * decay)
 
   local inferred = math.max(
     state.adaptiveGenPeak or gen,
-    (state.adaptiveDrainPeak or drain) * 5,
-    gen * 1.05,
-    drain * 6,
+    (state.adaptiveDrainPeak or drain) * 6,
+    gen * 1.20,
+    drain * 8,
     1000000
   )
 
-  state.adaptiveScale = lerp(state.adaptiveScale, inferred, learnAllowed and learn or (learn * 0.15))
-  state.adaptiveScale = clamp(state.adaptiveScale or inferred, 1000000, CONFIG.maxOutput)
+  state.adaptiveScale = lerp(state.adaptiveScale, inferred, learn)
+  state.adaptiveScale = clamp(state.adaptiveScale or inferred, 1000000, CONFIG.outputHeatCapMax)
 end
 
 local function scaleValue(factor, minVal, maxVal)
@@ -906,14 +841,6 @@ local function redraw(forceStatic)
   end
 end
 
-
-local function requestFullRedraw()
-  state.redrawQueued = true
-  uiDirty = true
-  lastStaticPage = nil
-  clearCache()
-end
-
 local function handleTouch(side, x, y)
   if side ~= monName then return end
   for _, b in pairs(buttons) do
@@ -991,7 +918,6 @@ local function processOperatorRequests(info)
     state.fieldDipCount = 0
     state.justRecovered = false
     state.outputBias = 0
-    state.driveBias = 0
     state.mode = "charging"
     resetPIDs()
 
@@ -1140,7 +1066,6 @@ local function applyPrimingControl(info)
     state.fieldDipCount = 0
     state.justRecovered = false
     state.outputBias = 0
-    state.driveBias = 0
     state.mode = "startup_hold"
     uiDirty = true
     setStatus("Activated - startup hold", colors.lime)
@@ -1250,7 +1175,6 @@ local function applyStartupBleedControl(info)
     resetPIDs()
     state.fieldRecovery = false
     state.outputBias = math.min(state.lastOutput, gen * 0.35)
-    state.driveBias = 0
     uiDirty = true
     setStatus("Startup complete - run mode", colors.lime)
     return
@@ -1273,23 +1197,18 @@ local function applyRunControl(info, dt)
   local fSat = state.filtSat or rawSat
   local fTemp = state.filtTemp or rawTemp
   local prevField = state.prevFiltField or fField
-  local prevRawField = state.prevRawField or rawField
-  local prevSat = state.prevFiltSat or fSat
-  local satDelta = fSat - prevSat
   local fup = fuelPct(info)
-  local gen = math.max(0, info.generationRate or 0)
-  local drain = math.max(0, info.fieldDrainRate or 0)
+  local gen = info.generationRate or 0
   local gScale = gainScale()
 
   local fieldDelta = fField - prevField
-  local rawFieldDelta = rawField - prevRawField
   local recoverEnter = fieldRecoverEnterThreshold()
   local recoverExit = fieldRecoverExitThreshold()
   local fieldSoftBand = fieldSoftThreshold()
   local fieldHardBand = fieldHardThreshold()
 
-  local severeFieldDip = (rawField <= fieldHardBand) or (fField <= fieldHardBand) or (rawFieldDelta <= -(CONFIG.fieldDropTrip * 1.35)) or (fieldDelta <= -CONFIG.fieldDropTrip)
-  local shakyField = (rawField <= recoverEnter) or (fField <= recoverEnter) or (rawFieldDelta <= -(CONFIG.fieldDropTrip * 0.65)) or (fieldDelta <= -(CONFIG.fieldDropTrip * 0.50))
+  local severeFieldDip = (fField < fieldHardBand) or (fieldDelta <= -CONFIG.fieldDropTrip)
+  local shakyField = (fField < recoverEnter) or (fieldDelta <= -(CONFIG.fieldDropTrip * 0.55))
 
   if severeFieldDip then
     state.fieldDipCount = CONFIG.fieldTripSamples
@@ -1301,34 +1220,28 @@ local function applyRunControl(info, dt)
 
   if severeFieldDip or (state.fieldDipCount or 0) >= CONFIG.fieldTripSamples then
     state.fieldRecovery = true
-  elseif state.fieldRecovery and fField > recoverExit and rawField > (recoverExit - 1) and rawFieldDelta >= -0.25 and fieldDelta >= -0.25 then
+  elseif state.fieldRecovery and fField > recoverExit and rawField > math.max(recoverExit - 1, CONFIG.targetField + 3) and fieldDelta >= -1.0 then
     state.fieldRecovery = false
     state.fieldDipCount = 0
     state.justRecovered = true
   end
 
-  local holdFieldTarget = math.max(CONFIG.targetField + 16, 62)
+  local holdFieldTarget = CONFIG.targetField + 8
   local wantIn, baseIn = computeRunInput(info, dt, holdFieldTarget)
   local scale = adaptiveScaleNow()
-  local actualDrain = math.max(0, -satDelta)
 
   if state.fieldRecovery then
-    local recoverTarget = math.max(CONFIG.targetField + 18, 64)
+    local recoverTarget = CONFIG.targetField + 10
     baseIn = computeBaseInput(info, recoverTarget)
-    local recoverExtra = scaleValue(0.28, 4000000, 18000000)
-    wantIn = math.max(baseIn * 1.36, CONFIG.bleedInputFloor, baseIn + recoverExtra)
-    wantIn = slew(state.lastInput, clamp(wantIn, 0, CONFIG.maxInput), CONFIG.inputRampUp * 1.6, CONFIG.inputRampDown)
+    local recoverExtra = scaleValue(0.45, 2500000, 12000000)
+    wantIn = math.max(baseIn * 1.22, CONFIG.bleedInputFloor, baseIn + recoverExtra)
+    wantIn = slew(state.lastInput, clamp(wantIn, 0, CONFIG.maxInput), CONFIG.inputRampUp, CONFIG.inputRampDown)
 
-    local keepFrac = 0.06
-    if rawField > recoverExit and rawFieldDelta >= 0 and fieldDelta >= 0 then
-      keepFrac = 0.14
+    local keepOut = math.min(state.lastOutput * 0.35, gen * 0.08)
+    if severeFieldDip or fField < fieldHardBand or fSat < CONFIG.satLowBand then
+      keepOut = 0
     end
-    if severeFieldDip or rawField < fieldHardBand or fSat < CONFIG.satLowBand then
-      keepFrac = 0.00
-    end
-
-    local keepOut = math.min(state.lastOutput * 0.35, gen * keepFrac)
-    local wantOut = slew(state.lastOutput, clamp(keepOut, 0, CONFIG.maxOutput), CONFIG.outputRampUp, CONFIG.outputRampDown * 2.2)
+    local wantOut = slew(state.lastOutput, clamp(keepOut, 0, CONFIG.maxOutput), CONFIG.outputRampUp, CONFIG.outputRampDown)
 
     gateSet(gateIn, wantIn)
     gateSet(gateOut, wantOut)
@@ -1336,11 +1249,10 @@ local function applyRunControl(info, dt)
     state.lastInput = wantIn
     state.lastOutput = wantOut
     state.outputBias = wantOut
-    state.driveBias = 0
     state.mode = "recover"
     setStatus(
-      ("Field recovery F:%.1f/%.1f dF:%.1f rDF:%.1f dips:%d In:%s Out:%s"):format(
-        rawField, fField, fieldDelta, rawFieldDelta, state.fieldDipCount or 0, fmtInt(wantIn), fmtInt(wantOut)
+      ("Field recovery F:%.1f raw:%.1f dF:%.1f dips:%d In:%s Out:%s"):format(
+        fField, rawField, fieldDelta, state.fieldDipCount or 0, fmtInt(wantIn), fmtInt(wantOut)
       ),
       colors.orange
     )
@@ -1351,105 +1263,94 @@ local function applyRunControl(info, dt)
   local tempError = CONFIG.targetTemp - fTemp
   local satSurplus = math.max(0, fSat - CONFIG.targetSaturation)
   local tempDeficit = math.max(0, CONFIG.targetTemp - fTemp)
-  local fieldHeadroom = math.max(0, math.min(rawField, fField) - CONFIG.targetField)
+  local fieldHeadroom = math.max(0, fField - CONFIG.targetField)
 
-  adaptPIDChannel(pidOutSat, state.pidAdapt and state.pidAdapt.outputSat, satError, dt)
-  adaptPIDChannel(pidOutTemp, state.pidAdapt and state.pidAdapt.outputTemp, tempError, dt)
   local outSatTrim  = pidUpdate(pidOutSat, satError, dt)
   local outTempTrim = pidUpdate(pidOutTemp, tempError, dt)
 
-  local biasUp = math.max(CONFIG.outputBiasStepUpBase * gScale, scaleValue(0.018, 350000, 2500000))
-  local biasDown = math.max(CONFIG.outputBiasStepDownBase, scaleValue(0.018, 280000, 2200000))
-  local biasDownFast = math.max(CONFIG.outputBiasStepDownFast, scaleValue(0.055, 2500000, 12000000))
+  local biasUp = math.max(CONFIG.outputBiasStepUpBase * gScale, scaleValue(0.045, 500000, 4500000))
+  local biasDown = math.max(CONFIG.outputBiasStepDownBase, scaleValue(0.012, 180000, 2000000))
+  local biasDownFast = math.max(CONFIG.outputBiasStepDownFast, scaleValue(0.035, 650000, 5000000))
 
-  local reserveRatio = clamp((math.min(rawField, fField) - (CONFIG.targetField + 8)) / 20, 0, 1)
-  local tempFactor = clamp((CONFIG.targetTemp - fTemp) / math.max(CONFIG.targetTemp, 1), 0, 1)
-  local satFactor = clamp((fSat - CONFIG.targetSaturation) / 35, 0, 1)
-  local drainError = math.max(0, (CONFIG.targetSatDrainPerTick or 0.08) - actualDrain)
+  local outputFactorMax = CONFIG.outputBiasMaxFactorBase + ((gScale - 1.0) * 0.22)
+  outputFactorMax = clamp(outputFactorMax, 0.25, 0.98)
 
-  local maxAllowedOut = gen * (0.52 + reserveRatio * 0.36 + satFactor * 0.14 + tempFactor * 0.08)
-  if tempDeficit > 1800 and satSurplus > 18 and fieldHeadroom > 14 and rawFieldDelta >= -0.20 and fieldDelta >= -0.20 then
-    maxAllowedOut = math.max(maxAllowedOut, gen * 1.12)
-  elseif tempDeficit > 900 and satSurplus > 10 and fieldHeadroom > 10 and rawFieldDelta >= -0.15 then
-    maxAllowedOut = math.max(maxAllowedOut, gen * 1.00)
+  local baseAllowedOut = gen * outputFactorMax
+  local safeOvershoot = gen * (1.04 + clamp(fieldHeadroom / 20, 0, 0.45))
+  local forcedDemand =
+    safeOvershoot +
+    (satSurplus * scaleValue(0.018, 90000, 400000)) +
+    (tempDeficit * scaleValue(0.00022, 250, 5000))
+
+  local maxAllowedOut = baseAllowedOut
+
+  if fTemp < CONFIG.targetTemp - 1000 and fSat > CONFIG.targetSaturation + 10 and fField > recoverExit then
+    maxAllowedOut = math.max(maxAllowedOut, gen * CONFIG.outputBiasHeatPushFactor)
   end
 
-  local inputHeadroom = math.max(0, (state.lastInput or 0) - drain)
-  local inputAssistCap = gen + (inputHeadroom * 0.45) + (drain * reserveRatio * 0.35)
-  maxAllowedOut = math.min(math.max(maxAllowedOut, gen * 0.35), inputAssistCap)
-  maxAllowedOut = clamp(maxAllowedOut, 0, CONFIG.maxOutput)
+  if fField > recoverExit then
+    maxAllowedOut = math.max(maxAllowedOut, forcedDemand)
+  elseif fField > fieldSoftBand then
+    maxAllowedOut = math.max(maxAllowedOut, forcedDemand * 0.70)
+  end
 
-  local biasBase = (state.outputBias * 0.72) + outSatTrim + outTempTrim
+  if fField > recoverExit and fSat > CONFIG.targetSaturation + 5 then
+    local demandCap =
+      safeOvershoot +
+      (satSurplus * scaleValue(0.022, 120000, 500000)) +
+      (tempDeficit * scaleValue(0.00026, 220, 6000))
+    maxAllowedOut = math.max(maxAllowedOut, math.min(CONFIG.outputHeatCapMax, demandCap))
+  end
+
+  maxAllowedOut = clamp(maxAllowedOut, 0, math.min(CONFIG.maxOutput, CONFIG.outputHeatCapMax))
+
+  local biasBase = state.outputBias + outSatTrim + outTempTrim
   local biasTarget = biasBase
 
-  local forcedDemand = 0
-  if tempDeficit > 1200 and satSurplus > 16 and fieldHeadroom > 14 and rawFieldDelta >= -0.20 and fieldDelta >= -0.20 then
-    forcedDemand = gen * (0.90 + math.min(0.22, tempFactor * 0.18 + satFactor * 0.12))
-  elseif tempDeficit > 500 and satSurplus > 8 and fieldHeadroom > 10 and rawFieldDelta >= -0.15 then
-    forcedDemand = gen * 0.72
+  if fieldHeadroom >= 10 and satSurplus >= 15 then
+    biasTarget = math.max(biasTarget, gen * 0.34)
+  elseif fieldHeadroom >= 6 and satSurplus >= 8 then
+    biasTarget = math.max(biasTarget, gen * 0.26)
+  elseif fieldHeadroom >= 3 then
+    biasTarget = math.max(biasTarget, gen * 0.20)
   end
 
-  local cold = fTemp < (CONFIG.targetTemp - 2000)
-  local overfull = fSat > (CONFIG.targetSaturation + 20)
-  local strongField = math.min(rawField, fField) > (CONFIG.targetField + 10)
-  local safeFieldMotion = rawFieldDelta >= -0.08 and fieldDelta >= -0.08
-
-  if cold and overfull and strongField and safeFieldMotion then
-    local forcedColdOutput =
-      gen +
-      ((info.maxEnergySaturation or 0) * 0.0000009) +
-      (drain * 1.8)
-
-    forcedDemand = math.max(forcedDemand, forcedColdOutput)
-  end
-
-  if gen <= 0 and fSat > 90 and strongField and rawFieldDelta > -0.10 and fieldDelta > -0.10 then
-    forcedDemand = math.max(forcedDemand, 2000000)
-  end
-
-  if forcedDemand > 0 then
-    state.driveBias = slew(state.driveBias or 0, math.min(maxAllowedOut, forcedDemand), biasUp, biasDown)
-  else
-    state.driveBias = slew(state.driveBias or 0, 0, math.max(biasDownFast, biasDown), math.max(biasDownFast, biasDown))
-  end
-
-  biasTarget = math.max(biasTarget, state.driveBias or 0)
-
-  if drainError <= 0 and fieldHeadroom >= 12 and satSurplus >= 10 and rawFieldDelta >= -0.10 then
-    biasTarget = math.max(biasTarget, gen * 0.82)
-  elseif drainError > 0 and fieldHeadroom >= 10 and satSurplus >= 8 and rawFieldDelta >= -0.10 then
-    biasTarget = math.max(biasTarget, gen * 0.70)
+  if fField > recoverExit and satSurplus > 5 then
+    local forcedFloor =
+      safeOvershoot +
+      (satSurplus * scaleValue(0.020, 110000, 450000)) +
+      (tempDeficit * scaleValue(0.00024, 280, 5200))
+    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, forcedFloor))
+  elseif fField > fieldSoftBand and satSurplus > 10 then
+    local warmupFloor =
+      gen * 0.95 +
+      (satSurplus * scaleValue(0.010, 60000, 200000)) +
+      (tempDeficit * scaleValue(0.00010, 120, 2400))
+    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, warmupFloor))
   end
 
   if state.justRecovered then
-    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, gen * 0.60))
+    biasTarget = math.max(biasTarget, math.min(maxAllowedOut, math.max(gen * 0.35, scaleValue(0.25, 1200000, 8000000))))
   end
 
-  if rawField < fieldHardBand or fField < fieldHardBand or fSat < CONFIG.satLowBand then
-    biasTarget = math.min(biasTarget, gen * 0.02)
-    wantIn = math.max(wantIn, baseIn * 1.32)
-    state.driveBias = 0
-  elseif rawField < fieldSoftBand or fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
-    biasTarget = math.min(biasTarget, gen * 0.16)
-    wantIn = math.max(wantIn, baseIn * 1.18)
+  if fField < fieldHardBand or fSat < CONFIG.satLowBand then
+    biasTarget = math.min(biasTarget, gen * 0.05)
+    wantIn = math.max(wantIn, baseIn * 1.22)
+  elseif fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
+    biasTarget = math.min(biasTarget, gen * 0.25)
+    wantIn = math.max(wantIn, baseIn * 1.12)
   end
 
-  if rawFieldDelta < -1.20 or fieldDelta < -1.00 then
-    biasTarget = math.min(biasTarget, gen * 0.04)
-    wantIn = math.max(wantIn, baseIn * 1.26)
-    state.driveBias = 0
-  elseif rawFieldDelta < -0.65 or fieldDelta < -0.55 then
-    biasTarget = math.min(biasTarget, gen * 0.10)
-    wantIn = math.max(wantIn, baseIn * 1.18)
-  elseif rawFieldDelta < -0.30 or fieldDelta < -0.25 then
-    biasTarget = math.min(biasTarget, gen * 0.22)
+  if fieldDelta < -2.0 then
+    biasTarget = math.min(biasTarget, gen * 0.15)
+    wantIn = math.max(wantIn, baseIn * 1.16)
+  elseif fieldDelta < -1.0 then
+    biasTarget = math.min(biasTarget, gen * 0.25)
     wantIn = math.max(wantIn, baseIn * 1.10)
   end
 
-  if fTemp > CONFIG.targetTemp + 80 then
-    biasTarget = math.min(biasTarget, gen * 0.60)
-  elseif fTemp > CONFIG.targetTemp + 20 then
-    biasTarget = math.min(biasTarget, gen * 0.78)
+  if fTemp > CONFIG.targetTemp - 50 then
+    biasTarget = math.min(biasTarget, gen * 0.22)
   end
 
   biasTarget = clamp(biasTarget, 0, maxAllowedOut)
@@ -1458,36 +1359,21 @@ local function applyRunControl(info, dt)
   local biasStepDownNow = biasDown
 
   if state.justRecovered then
-    biasStepUp = math.max(biasStepUp, scaleValue(0.020, 500000, 1800000))
+    biasStepUp = math.max(biasStepUp, scaleValue(0.060, CONFIG.outputRampUp * 2, 6000000))
   end
 
-  if rawFieldDelta < -0.25 or fieldDelta < -0.25 or rawField < fieldSoftBand or fField < fieldSoftBand then
+  if fieldDelta < -1.0 or fField < fieldSoftBand or fSat < CONFIG.satSoftBand then
     biasStepDownNow = biasDownFast
   end
 
   state.outputBias = slew(state.outputBias, biasTarget, biasStepUp, biasStepDownNow)
   state.justRecovered = false
 
-  local outputRampUp = math.max(CONFIG.outputRampUp, scaleValue(0.010, 250000, 1000000))
-  local outputRampDown = math.max(CONFIG.outputRampDown, scaleValue(0.110, 5000000, 22000000))
-  local dynamicRampUp = outputRampUp
+  local outputRampUp = math.max(CONFIG.outputRampUp, scaleValue(0.030, 350000, 4000000))
+  local outputRampDown = math.max(CONFIG.outputRampDown, scaleValue(0.080, 2500000, 12000000))
+  local wantOut = slew(state.lastOutput, state.outputBias, outputRampUp, outputRampDown)
 
-  if cold and strongField and rawFieldDelta >= -0.08 and fieldDelta >= -0.08 then
-    dynamicRampUp = math.max(dynamicRampUp, outputRampUp * 2.5)
-  end
-
-  if rawFieldDelta < -0.60 or fieldDelta < -0.50 then
-    dynamicRampUp = math.max(120000, dynamicRampUp * 0.15)
-  elseif rawFieldDelta < -0.25 or fieldDelta < -0.20 then
-    dynamicRampUp = math.max(180000, dynamicRampUp * 0.35)
-  elseif rawFieldDelta < -0.10 or fieldDelta < -0.10 then
-    dynamicRampUp = math.max(220000, dynamicRampUp * 0.60)
-  end
-
-  wantIn = clamp(wantIn, 0, CONFIG.maxInput)
-  local wantOut = slew(state.lastOutput, state.outputBias, dynamicRampUp, outputRampDown)
-
-  gateSet(gateIn, wantIn)
+  gateSet(gateIn, clamp(wantIn, 0, CONFIG.maxInput))
   gateSet(gateOut, clamp(wantOut, 0, CONFIG.maxOutput))
 
   state.lastInput = wantIn
@@ -1499,8 +1385,8 @@ local function applyRunControl(info, dt)
   state.fieldDipCount = math.max((state.fieldDipCount or 0) - 1, 0)
 
   setStatus(
-    ("Run | T:%d F:%.1f/%.1f rDF:%.2f dF:%.2f dS:%.2f dips:%d S:%.1f/%.1f Fuel:%.1f%% Out:%s Max:%s In:%s"):format(
-      rawTemp, rawField, fField, rawFieldDelta, fieldDelta, actualDrain, state.fieldDipCount or 0, rawSat, fSat, fup, fmtInt(wantOut), fmtInt(maxAllowedOut), fmtInt(wantIn)
+    ("Run | T:%d F:%.1f/%.1f dF:%.1f dips:%d S:%.1f/%.1f Fuel:%.1f%% Out:%s Scale:%s"):format(
+      rawTemp, rawField, fField, fieldDelta, state.fieldDipCount or 0, rawSat, fSat, fup, fmtInt(wantOut), fmtInt(scale)
     ),
     colors.lime
   )
@@ -1548,13 +1434,10 @@ local function applyControl(info, dt)
     state.fieldDipCount = 0
     state.justRecovered = false
     state.outputBias = 0
-    state.driveBias = 0
     state.filtField = nil
     state.filtSat = nil
     state.filtTemp = nil
     state.prevFiltField = nil
-    state.prevFiltSat = nil
-    state.prevRawField = nil
     state.mode = "idle"
     uiDirty = true
 
@@ -1578,7 +1461,6 @@ local function applyControl(info, dt)
     state.fieldDipCount = 0
     state.justRecovered = false
     state.outputBias = 0
-    state.driveBias = 0
     uiDirty = true
     applyCoolingControl(info)
     return
@@ -1632,11 +1514,6 @@ local function controlLoop()
     if not info then
       setStatus("No reactor info", colors.red)
       gateSet(gateOut, 0)
-      gateSet(gateIn, 0)
-      state.lastInput = 0
-      state.lastOutput = 0
-      state.outputBias = 0
-      state.driveBias = 0
     else
       applyControl(info, dt)
     end
