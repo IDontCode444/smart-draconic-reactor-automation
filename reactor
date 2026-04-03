@@ -1,8 +1,11 @@
 -- Draconic Reactor Auto Controller for CC:Tweaked
--- Designed for named peripherals like:
+-- ATM10 / Draconic Evolution reactor controller
+--
+-- Named peripherals expected:
 --   reactor:     draconic_reactor_0
 --   input gate:  flow_gate_0
 --   output gate: flow_gate_1
+--
 -- Monitor is auto-detected.
 --
 -- UI:
@@ -10,10 +13,9 @@
 --   Tuning screen: adjust Temp / Field / Saturation / Output targets
 --
 -- Notes:
--- - Uses buffered monitor rendering to avoid flicker.
--- - Tries multiple gate/reactor methods for compatibility.
--- - Output is automatically pushed toward maximum stable power while
---   keeping the reactor inside your chosen targets.
+-- - Buffered monitor rendering prevents flicker.
+-- - Charging logic respects the reactor's 50% field + 50% saturation charge state.
+-- - Output auto-regulates for highest stable output at lowest safe field input.
 
 -------------------------
 -- USER EDITABLE NAMES  --
@@ -31,19 +33,19 @@ local defaults = {
   monitorTextScale = 0.5,
 
   targets = {
-    temp   = 7800,     -- ideal is near 8000C
-    field  = 45,       -- %
-    sat    = 25,       -- %
-    output = 2500000,  -- rf/t cap
+    temp   = 7800,        -- efficient target is near 8000C
+    field  = 45,          -- running target %
+    sat    = 25,          -- running target %
+    output = 10000000,    -- 10M rf/t default cap
   },
 
   limits = {
-    minFieldThrottle = 22,   -- below this, sharply cut output
-    minFieldScram    = 10,   -- below this, scram
-    minSatThrottle   = 8,    -- below this, sharply cut output
-    minSatScram      = 3,    -- below this, scram
-    maxTempThrottle  = 8050, -- start aggressively backing off
-    maxTempScram     = 8400, -- hard scram
+    minFieldThrottle = 22,
+    minFieldScram    = 10,
+    minSatThrottle   = 8,
+    minSatScram      = 3,
+    maxTempThrottle  = 8050,
+    maxTempScram     = 8400,
   },
 
   control = {
@@ -54,7 +56,7 @@ local defaults = {
     fieldCorrection    = 0.12,
     outputRampFraction = 0.06,
     outputStepMin      = 10000,
-    outputStepMax      = 250000,
+    outputStepMax      = 5000000,
     saveEverySeconds   = 5,
   }
 }
@@ -121,8 +123,10 @@ end
 local function fmtRF(n)
   n = tonumber(n) or 0
   local abs = math.abs(n)
-  if abs >= 1000000000 then
-    return string.format("%.2fG", n / 1000000000)
+  if abs >= 1000000000000 then
+    return string.format("%.2fT", n / 1000000000000)
+  elseif abs >= 1000000000 then
+    return string.format("%.2fB", n / 1000000000)
   elseif abs >= 1000000 then
     return string.format("%.2fM", n / 1000000)
   elseif abs >= 1000 then
@@ -140,16 +144,6 @@ end
 
 local function hasMethod(obj, name)
   return obj and type(obj[name]) == "function"
-end
-
-local function callIf(obj, methods, ...)
-  for i = 1, #methods do
-    local m = methods[i]
-    if hasMethod(obj, m) then
-      return obj[m](...)
-    end
-  end
-  return nil
 end
 
 -------------------------
@@ -401,19 +395,15 @@ local function calcWantedOutput(info, currentOut)
   local minFieldThrottle = math.max(settings.limits.minFieldThrottle, fieldTarget - 12)
 
   local score = 0
-
-  -- Increase output when saturation is above target or temp is below target.
   score = score + ((info.satPct - targetSat) * 1.8)
   score = score + ((targetTemp - info.temperature) / 120)
 
-  -- Penalize output harder when field drops below target.
   if info.fieldPct < fieldTarget then
     score = score - ((fieldTarget - info.fieldPct) * 4.0)
   else
     score = score + ((info.fieldPct - fieldTarget) * 0.4)
   end
 
-  -- Hard penalties near safety edges.
   if info.fieldPct < minFieldThrottle then
     score = score - ((minFieldThrottle - info.fieldPct) * 10)
   end
@@ -426,15 +416,12 @@ local function calcWantedOutput(info, currentOut)
 
   local step = math.max(
     settings.control.outputStepMin,
-    math.min(settings.control.outputStepMax, currentOut * settings.control.outputRampFraction)
+    math.min(settings.control.outputStepMax, math.max(100000, currentOut * settings.control.outputRampFraction))
   )
 
   local wanted = currentOut + (score * step)
-
-  -- Clamp to a reasonable upper bound.
   wanted = clamp(wanted, 0, maxOut)
 
-  -- Extra safety clamps.
   if info.fieldPct < minFieldThrottle or info.satPct < settings.limits.minSatThrottle or info.temperature > settings.limits.maxTempThrottle then
     wanted = math.min(wanted, currentOut * 0.70, info.generationRate * 1.05)
   end
@@ -451,7 +438,6 @@ local function hardScram(info, why)
   state.message = "SCRAM: " .. why
   pcall(reactorStop)
 
-  -- During scram/cooling keep output open and field fed.
   local inFlow = calcWantedInput(info)
   local outFlow = math.max(getGateFlow(outputGate), info.generationRate)
 
@@ -514,10 +500,19 @@ local function controlTick()
     return
   end
 
+  -- Charging phase: field and saturation only need 50%
   if isChargingLike(info.status) and not isRunningLike(info.status) then
-    pcall(setGateFlow, outputGate, 0)
-    pcall(setGateFlow, inputGate, settings.control.chargeFlow)
-    state.message = "Charging reactor"
+    local chargeReady = (info.fieldPct >= 50) and (info.satPct >= 50)
+
+    if chargeReady then
+      pcall(setGateFlow, inputGate, 0)
+      pcall(setGateFlow, outputGate, 0)
+      state.message = "Charge complete - ready to activate"
+    else
+      pcall(setGateFlow, outputGate, 0)
+      pcall(setGateFlow, inputGate, settings.control.chargeFlow)
+      state.message = "Charging reactor (need 50% field/sat)"
+    end
     return
   end
 
@@ -759,13 +754,19 @@ local function adjustSetting(path1, path2, delta, lo, hi)
   saveSettings(true)
 end
 
-local function drawTuneRow(y, label, value, minusFn, plusFn, valueColor)
+local function drawTuneRow(y, label, value, buttons, valueColor)
   local w = screen.w
   writeAt(2, y, label, colors.lightGray, colors.black)
-  writeAt(math.floor(w / 2) - 4, y, tostring(value), valueColor or colors.white, colors.black)
+  writeAt(math.floor(w / 2) - 6, y, tostring(value), valueColor or colors.white, colors.black)
 
-  addButton(w - 12, y, 5, 1, " - ", colors.gray, colors.white, minusFn)
-  addButton(w - 6,  y, 5, 1, " + ", colors.gray, colors.white, plusFn)
+  local x = w - 1
+  for i = #buttons, 1, -1 do
+    local b = buttons[i]
+    local bw = #b.label + 2
+    x = x - bw + 1
+    addButton(x, y, bw, 1, b.label, b.bg or colors.gray, b.fg or colors.white, b.fn)
+    x = x - 1
+  end
 end
 
 local function drawTunePage()
@@ -774,34 +775,34 @@ local function drawTunePage()
 
   writeAt(1, 1, centerText(w, "TUNING"), colors.white, colors.blue)
   writeAt(2, 3, "Adjust reactor targets.", colors.white, colors.black)
-  writeAt(2, 4, "Higher output = more risk. Field/temp are the key safety knobs.", colors.lightGray, colors.black)
+  writeAt(2, 4, "Output target now supports multi-million and 100M jumps.", colors.lightGray, colors.black)
 
-  drawTuneRow(6,  "Temp Target (C)", settings.targets.temp,
-    function() adjustSetting("targets", "temp", -50, 2500, 8000) end,
-    function() adjustSetting("targets", "temp",  50, 2500, 8000) end,
-    colors.orange
-  )
+  drawTuneRow(6, "Temp Target (C)", settings.targets.temp, {
+    { label = "-50", fn = function() adjustSetting("targets", "temp", -50, 2500, 8000) end },
+    { label = "+50", fn = function() adjustSetting("targets", "temp",  50, 2500, 8000) end },
+  }, colors.orange)
 
-  drawTuneRow(8,  "Field Target (%)", settings.targets.field,
-    function() adjustSetting("targets", "field", -1, 20, 80) end,
-    function() adjustSetting("targets", "field",  1, 20, 80) end,
-    colors.lime
-  )
+  drawTuneRow(8, "Field Target (%)", settings.targets.field, {
+    { label = "-1", fn = function() adjustSetting("targets", "field", -1, 20, 80) end },
+    { label = "+1", fn = function() adjustSetting("targets", "field",  1, 20, 80) end },
+  }, colors.lime)
 
-  drawTuneRow(10, "Sat Target (%)", settings.targets.sat,
-    function() adjustSetting("targets", "sat", -1, 5, 95) end,
-    function() adjustSetting("targets", "sat",  1, 5, 95) end,
-    colors.cyan
-  )
+  drawTuneRow(10, "Sat Target (%)", settings.targets.sat, {
+    { label = "-1", fn = function() adjustSetting("targets", "sat", -1, 5, 95) end },
+    { label = "+1", fn = function() adjustSetting("targets", "sat",  1, 5, 95) end },
+  }, colors.cyan)
 
-  drawTuneRow(12, "Output Cap (rf/t)", fmtRF(settings.targets.output),
-    function() adjustSetting("targets", "output", -50000, 0, 5000000000) end,
-    function() adjustSetting("targets", "output",  50000, 0, 5000000000) end,
-    colors.yellow
-  )
+  drawTuneRow(12, "Output Cap (rf/t)", fmtRF(settings.targets.output), {
+    { label = "-50k",  fn = function() adjustSetting("targets", "output", -50000, 0, 10000000000) end, bg = colors.gray },
+    { label = "+50k",  fn = function() adjustSetting("targets", "output",  50000, 0, 10000000000) end, bg = colors.gray },
+    { label = "-5M",   fn = function() adjustSetting("targets", "output", -5000000, 0, 10000000000) end, bg = colors.lightGray, fg = colors.black },
+    { label = "+5M",   fn = function() adjustSetting("targets", "output",  5000000, 0, 10000000000) end, bg = colors.lightGray, fg = colors.black },
+    { label = "-100M", fn = function() adjustSetting("targets", "output", -100000000, 0, 10000000000) end, bg = colors.yellow, fg = colors.black },
+    { label = "+100M", fn = function() adjustSetting("targets", "output",  100000000, 0, 10000000000) end, bg = colors.yellow, fg = colors.black },
+  }, colors.yellow)
 
-  writeAt(2, h - 5, "Recommended starting point:", colors.white, colors.black)
-  writeAt(2, h - 4, "Temp 7800 / Field 45 / Sat 25. Raise output cap only as needed.", colors.lightGray, colors.black)
+  writeAt(2, h - 5, "Suggested baseline:", colors.white, colors.black)
+  writeAt(2, h - 4, "Temp 7800 / Field 45 / Sat 25, then raise output cap gradually.", colors.lightGray, colors.black)
 
   addButton(2, h - 2, 10, 2, "HOME", colors.blue, colors.white, function()
     state.page = "main"
@@ -878,11 +879,9 @@ local function eventLoop()
       if touchedName == monitorName or touchedName == peripheral.getName(monitor) then
         handleTouch(x, y)
       else
-        -- Some setups report monitor events differently; still accept if only one monitor is used.
         handleTouch(x, y)
       end
     elseif ev == "peripheral_detach" or ev == "peripheral" then
-      -- Try to re-wrap if something changed.
       local ok, err = pcall(function()
         initPeripherals()
         initScreen()
