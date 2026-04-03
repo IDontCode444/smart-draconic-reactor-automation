@@ -1,71 +1,70 @@
--- draconic_reactor_controller.lua
--- CC: Tweaked / ATM10-friendly Draconic Evolution reactor controller
--- Main features:
---   * Auto-detects reactor + monitor
---   * Manual naming for input/output flow gates (saved to config)
---   * Main UI with Charge / Activate / SCRAM / Tuning
---   * Separate Auto / Manual mode
---   * Auto warm-up and output ramp logic
---   * Anti-lock / watchdog checks for stale peripherals and gate write failures
+-- draconic_reactor_controller_all_in_one.lua
+-- All-in-one Draconic Evolution reactor controller for CC: Tweaked
+-- No external config file is created.
 --
--- INSTALL:
---   1) Put this file on an Advanced Computer as startup or run it manually.
---   2) Make sure the reactor peripheral and a monitor are connected.
---   3) On first launch, enter your input and output flow-gate peripheral names.
---      Example: flow_gate_0 and flow_gate_1
+-- IMPORTANT:
+--   Edit INPUT_GATE_NAME and OUTPUT_GATE_NAME below to match your setup.
+--   Example: "flow_gate_0" and "flow_gate_1"
 --
--- NOTES:
---   * Best reliability is direct peripheral attachment for the two flow gates.
---   * The script will still work with manually named peripherals if your setup exposes them.
+-- Notes:
+--   * Reactor + monitor are auto-detected.
+--   * Input/output flow gates are NOT auto-detected by design.
+--   * Field and saturation warm-up logic respects the fact that both only
+--     charge to ~50% before full activation.
+--   * Includes Auto/Manual mode, Charge / Activate / SCRAM / Tuning UI.
+--   * Tuning screen lets you change targets live while the script is running.
+--   * No external cfg means all settings reset to defaults when restarted.
 
-local VERSION = "1.0"
+local VERSION = "3.0"
 
-local CONFIG_PATH = "draconic_reactor_ctrl.cfg"
+-- =========================
+-- USER EDITABLE CONSTANTS
+-- =========================
+local INPUT_GATE_NAME = "flow_gate_0"
+local OUTPUT_GATE_NAME = "flow_gate_1"
 
-local DEFAULTS = {
-  inputGateName = "",
-  outputGateName = "",
-  mode = "auto",                 -- auto | manual
+local SETTINGS = {
+  mode = "auto",                -- "auto" or "manual"
   autoActivate = true,
 
-  targetField = 50.0,            -- preferred steady-state field %
-  minField = 30.0,               -- scram below this while running
-  activateField = 52.0,          -- min field % before activate
+  -- Warm-up / activation assumptions:
+  -- Before activation, field and saturation can only reach ~50%.
+  preActivateField = 48.5,
+  preActivateSaturation = 48.5,
+  preActivateTemp = 2000,
 
-  targetSaturation = 45.0,       -- preferred steady-state saturation %
-  minSaturation = 15.0,          -- scram below this while running
-  activateSaturation = 50.0,     -- min saturation % before activate
+  -- Running targets:
+  targetField = 45.0,
+  minField = 28.0,
+  targetSaturation = 55.0,
+  minSaturation = 20.0,
+  targetTemp = 7600,
+  maxTemp = 7900,
 
-  targetTemp = 7600,             -- high-output operating target
-  maxTemp = 7900,                -- scram above this
-  activateTemp = 2050,           -- warm-up threshold before activate
-  coolResumeTemp = 5000,         -- informational only
-
-  baseWarmupInput = 3000000,     -- starting warm-up feed
-  maxInput = 25000000,
+  -- Flow limits:
   minInput = 0,
-  maxOutput = 50000000,
+  maxInput = 20000000,
   minOutput = 0,
+  maxOutput = 50000000,
 
-  inputRampPerTick = 250000,     -- smooth gate change limits
-  outputRampPerTick = 250000,
+  -- Smooth ramping:
+  inputRampPerTick = 150000,
+  outputRampPerTick = 150000,
 
+  -- Warm-up:
+  warmupInputBase = 2500000,
+  warmupInputMax = 12000000,
+
+  -- Manual mode targets:
   manualInput = 3000000,
   manualOutput = 0,
 
-  uiScale = 0.5
+  -- UI:
+  monitorScale = 0.5
 }
 
-local cfg = {}
-for k, v in pairs(DEFAULTS) do cfg[k] = v end
-
-local reactor
-local mon
+local reactor, monitor, inputGate, outputGate
 local monW, monH = 0, 0
-local inputGate
-local outputGate
-local inputGateName
-local outputGateName
 
 local currentInput = 0
 local currentOutput = 0
@@ -73,30 +72,20 @@ local targetInput = 0
 local targetOutput = 0
 
 local ui = {
-  screen = "main", -- main | tuning
+  screen = "main",
   buttons = {},
-  message = "Booting...",
-  lastTouch = 0
+  message = "Booting..."
 }
 
 local state = {
   lastInfo = nil,
-  lastPoll = 0,
+  staleInfoCount = 0,
+  gateWriteFailures = 0,
+  startupHoldTicks = 0,
+  activatedByScript = false,
   lastFieldPct = nil,
   lastSatPct = nil,
-  lastTemp = nil,
-  gateWriteFailures = 0,
-  staleInfoCount = 0,
-  runningTick = 0,
-  warmupTick = 0,
-  fieldDropTicks = 0,
-  satDropTicks = 0,
-  overTempTicks = 0,
-  lastAction = "none"
-}
-
-local colorsEx = {
-  orange = colors.orange or colors.yellow
+  lastTemp = nil
 }
 
 local function clamp(v, lo, hi)
@@ -128,66 +117,31 @@ local function pct(part, whole)
   return (part / whole) * 100
 end
 
-local function saveConfig()
-  local f = fs.open(CONFIG_PATH, "w")
-  if not f then return false end
-  for k, v in pairs(cfg) do
-    f.writeLine(k .. "=" .. tostring(v))
-  end
-  f.close()
-  return true
-end
-
-local function loadConfig()
-  if not fs.exists(CONFIG_PATH) then return false end
-  local f = fs.open(CONFIG_PATH, "r")
-  if not f then return false end
-  while true do
-    local line = f.readLine()
-    if not line then break end
-    local key, value = line:match("^([^=]+)=(.*)$")
-    if key then
-      if value == "true" then
-        cfg[key] = true
-      elseif value == "false" then
-        cfg[key] = false
-      elseif tonumber(value) then
-        cfg[key] = tonumber(value)
-      else
-        cfg[key] = value
-      end
-    end
-  end
-  f.close()
-  return true
-end
-
 local function setMessage(msg)
-  ui.message = msg
+  ui.message = tostring(msg or "")
 end
 
-local function findPeripheralByTypes(types)
+local function detectReactor()
+  local types = { "draconic_reactor", "draconic_reactor_component", "draconicreactor" }
   for _, name in ipairs(peripheral.getNames()) do
     local pType = peripheral.getType(name)
-    for _, wanted in ipairs(types) do
-      if pType == wanted then
-        return peripheral.wrap(name), name, pType
+    for _, t in ipairs(types) do
+      if pType == t then
+        return peripheral.wrap(name), name
       end
     end
   end
-  return nil, nil, nil
+  for _, name in ipairs(peripheral.getNames()) do
+    local p = peripheral.wrap(name)
+    if p and type(p.getReactorInfo) == "function" then
+      return p, name
+    end
+  end
+  return nil, nil
 end
 
-local function wrapPeripheral(name, expectedType)
-  if not name or name == "" then return nil end
-  if not peripheral.isPresent(name) then return nil end
-  local pType = peripheral.getType(name)
-  if expectedType and pType ~= expectedType then return nil end
-  return peripheral.wrap(name)
-end
-
-local function chooseLargestMonitor()
-  local bestMon, bestName, bestArea
+local function detectLargestMonitor()
+  local best, bestName, bestArea
   for _, name in ipairs(peripheral.getNames()) do
     if peripheral.getType(name) == "monitor" then
       local m = peripheral.wrap(name)
@@ -195,157 +149,72 @@ local function chooseLargestMonitor()
       if ok and w and h then
         local area = w * h
         if not bestArea or area > bestArea then
-          bestArea = area
-          bestMon = m
+          best = m
           bestName = name
+          bestArea = area
         end
       end
     end
   end
-  return bestMon, bestName
+  return best, bestName
+end
+
+local function wrapFlowGate(name)
+  if not name or name == "" then return nil end
+  if not peripheral.isPresent(name) then return nil end
+  if peripheral.getType(name) ~= "flow_gate" then return nil end
+  return peripheral.wrap(name)
 end
 
 local function readGate(gate)
   if not gate then return nil end
-  local ok, value = pcall(gate.getSignalLowFlow)
-  if ok then return tonumber(value) or 0 end
+  local ok, v = pcall(gate.getSignalLowFlow)
+  if ok then return tonumber(v) or 0 end
   return nil
 end
 
-local function writeGate(gate, value, kind)
-  value = math.floor(clamp(value, 0, kind == "input" and cfg.maxInput or cfg.maxOutput))
-  local ok = pcall(gate.setSignalLowFlow, value)
+local function writeGate(gate, value, maxValue, kind)
+  if not gate then return false end
+  local writeValue = math.floor(clamp(value, 0, maxValue))
+  local ok = pcall(gate.setSignalLowFlow, writeValue)
   if not ok then
     state.gateWriteFailures = state.gateWriteFailures + 1
     return false
   end
-
   local back = readGate(gate)
   if back == nil then
     state.gateWriteFailures = state.gateWriteFailures + 1
     return false
   end
-
-  if math.abs(back - value) > math.max(1000, value * 0.02) then
+  if math.abs(back - writeValue) > math.max(1000, writeValue * 0.02) then
     state.gateWriteFailures = state.gateWriteFailures + 1
     return false
   end
-
   state.gateWriteFailures = 0
   if kind == "input" then currentInput = back else currentOutput = back end
   return true
 end
 
-local function smoothStep(current, target, maxStep)
+local function smoothStep(current, target, step)
   if current < target then
-    return math.min(current + maxStep, target)
+    return math.min(current + step, target)
   elseif current > target then
-    return math.max(current - maxStep, target)
+    return math.max(current - step, target)
   end
   return current
-end
-
-local function detectPeripherals()
-  reactor = nil
-  local reactorTypes = {
-    "draconic_reactor",
-    "draconic_reactor_component",
-    "draconicreactor"
-  }
-
-  reactor = select(1, findPeripheralByTypes(reactorTypes))
-  if not reactor then
-    for _, name in ipairs(peripheral.getNames()) do
-      local p = peripheral.wrap(name)
-      if p and type(p.getReactorInfo) == "function" then
-        reactor = p
-        break
-      end
-    end
-  end
-
-  mon = select(1, chooseLargestMonitor())
-  if mon then
-    pcall(mon.setTextScale, cfg.uiScale)
-    mon.setBackgroundColor(colors.black)
-    mon.setTextColor(colors.white)
-    mon.clear()
-    monW, monH = mon.getSize()
-  end
-
-  inputGateName = cfg.inputGateName
-  outputGateName = cfg.outputGateName
-  inputGate = wrapPeripheral(inputGateName, "flow_gate")
-  outputGate = wrapPeripheral(outputGateName, "flow_gate")
-
-  return reactor ~= nil and mon ~= nil and inputGate ~= nil and outputGate ~= nil
-end
-
-local function promptForGateNames()
-  term.setBackgroundColor(colors.black)
-  term.setTextColor(colors.white)
-  term.clear()
-  term.setCursorPos(1, 1)
-  print("Draconic Reactor Controller v" .. VERSION)
-  print("")
-  print("Detected peripherals:")
-  for _, name in ipairs(peripheral.getNames()) do
-    print(" - " .. name .. " [" .. tostring(peripheral.getType(name)) .. "]")
-  end
-  print("")
-  write("Enter INPUT flow gate name: ")
-  cfg.inputGateName = read()
-  write("Enter OUTPUT flow gate name: ")
-  cfg.outputGateName = read()
-  saveConfig()
-end
-
-local function ensureSetup()
-  loadConfig()
-
-  while true do
-    local ok = detectPeripherals()
-    if ok then
-      currentInput = readGate(inputGate) or cfg.manualInput or 0
-      currentOutput = readGate(outputGate) or cfg.manualOutput or 0
-      return
-    end
-
-    if not cfg.inputGateName or cfg.inputGateName == "" or not cfg.outputGateName or cfg.outputGateName == "" then
-      promptForGateNames()
-    else
-      term.setBackgroundColor(colors.black)
-      term.setTextColor(colors.white)
-      term.clear()
-      term.setCursorPos(1, 1)
-      print("Waiting for peripherals...")
-      print("")
-      print("Need:")
-      print(" - Reactor peripheral")
-      print(" - Monitor")
-      print(" - Input gate:  " .. tostring(cfg.inputGateName))
-      print(" - Output gate: " .. tostring(cfg.outputGateName))
-      print("")
-      print("Press R to re-enter gate names.")
-      local timer = os.startTimer(2)
-      while true do
-        local e, p = os.pullEvent()
-        if e == "char" and (p == "r" or p == "R") then
-          promptForGateNames()
-          break
-        elseif e == "timer" and p == timer then
-          break
-        end
-      end
-    end
-  end
 end
 
 local function getInfo()
   if not reactor then return nil end
   local ok, info = pcall(reactor.getReactorInfo)
-  if not ok or type(info) ~= "table" then return nil end
-  return info
+  if ok and type(info) == "table" then
+    return info
+  end
+  return nil
+end
+
+local function reactorStatus(info)
+  return tostring((info and info.status) or "unknown")
 end
 
 local function fieldPct(info)
@@ -362,134 +231,9 @@ local function fuelPct(info)
   return clamp(100 - pct(used, maxFuel), 0, 100)
 end
 
-local function reactorStatus(info)
-  return tostring(info.status or "unknown")
-end
-
-local function statusColor(status)
-  if status == "running" then return colors.lime end
-  if status == "warming_up" then return colorsEx.orange end
-  if status == "cooling" then return colors.lightBlue end
-  if status == "stopping" then return colors.red end
-  return colors.lightGray
-end
-
-local function fieldColor(v)
-  if v >= cfg.targetField then return colors.lime end
-  if v >= cfg.minField then return colors.yellow end
-  return colors.red
-end
-
-local function satColor(v)
-  if v >= cfg.targetSaturation then return colors.lime end
-  if v >= cfg.minSaturation then return colors.yellow end
-  return colors.red
-end
-
-local function tempColor(v)
-  if v <= cfg.targetTemp then return colors.lime end
-  if v <= cfg.maxTemp then return colors.yellow end
-  return colors.red
-end
-
-local function bar(x, y, w, value, maxValue, fg, bg)
-  value = clamp(value, 0, maxValue)
-  local fill = 0
-  if maxValue > 0 then
-    fill = math.floor((value / maxValue) * w + 0.5)
-  end
-  mon.setCursorPos(x, y)
-  for i = 1, w do
-    if i <= fill then
-      mon.setBackgroundColor(fg)
-    else
-      mon.setBackgroundColor(bg)
-    end
-    mon.write(" ")
-  end
-  mon.setBackgroundColor(colors.black)
-end
-
-local function text(x, y, s, tc, bc)
-  mon.setCursorPos(x, y)
-  if bc then mon.setBackgroundColor(bc) end
-  if tc then mon.setTextColor(tc) end
-  mon.write(s)
-  mon.setBackgroundColor(colors.black)
-  mon.setTextColor(colors.white)
-end
-
-local function clearLine(y)
-  mon.setCursorPos(1, y)
-  mon.setBackgroundColor(colors.black)
-  mon.clearLine()
-end
-
-local function drawBox(x1, y1, x2, y2, border, fill)
-  fill = fill or colors.black
-  for y = y1, y2 do
-    mon.setCursorPos(x1, y)
-    for x = x1, x2 do
-      if y == y1 or y == y2 or x == x1 or x == x2 then
-        mon.setBackgroundColor(border)
-      else
-        mon.setBackgroundColor(fill)
-      end
-      mon.write(" ")
-    end
-  end
-  mon.setBackgroundColor(colors.black)
-end
-
-local function addButton(id, x1, y1, x2, y2, label, callback, bg, fg)
-  table.insert(ui.buttons, {
-    id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2,
-    label = label, callback = callback,
-    bg = bg or colors.gray, fg = fg or colors.white
-  })
-end
-
-local function drawButton(btn)
-  for y = btn.y1, btn.y2 do
-    mon.setCursorPos(btn.x1, y)
-    mon.setBackgroundColor(btn.bg)
-    mon.setTextColor(btn.fg)
-    mon.write(string.rep(" ", btn.x2 - btn.x1 + 1))
-  end
-  local cx = math.floor((btn.x1 + btn.x2 - #btn.label) / 2)
-  local cy = math.floor((btn.y1 + btn.y2) / 2)
-  text(cx, cy, btn.label, btn.fg, btn.bg)
-  mon.setBackgroundColor(colors.black)
-  mon.setTextColor(colors.white)
-end
-
-local function addParamButtons(name, display, y, stepSmall, stepBig, minVal, maxVal)
-  text(3, y, display, colors.white)
-  local val = cfg[name]
-  text(monW - 16, y, tostring(round(val, 1)), colors.cyan)
-
-  addButton(name .. "_mBig", 3, y + 1, 9, y + 2, "-big", function()
-    cfg[name] = clamp(cfg[name] - stepBig, minVal, maxVal)
-    saveConfig()
-  end, colors.red)
-  addButton(name .. "_mSmall", 11, y + 1, 17, y + 2, "-sm", function()
-    cfg[name] = clamp(cfg[name] - stepSmall, minVal, maxVal)
-    saveConfig()
-  end, colors.orange)
-  addButton(name .. "_pSmall", 19, y + 1, 25, y + 2, "+sm", function()
-    cfg[name] = clamp(cfg[name] + stepSmall, minVal, maxVal)
-    saveConfig()
-  end, colors.lime)
-  addButton(name .. "_pBig", 27, y + 1, 33, y + 2, "+big", function()
-    cfg[name] = clamp(cfg[name] + stepBig, minVal, maxVal)
-    saveConfig()
-  end, colors.green)
-end
-
 local function chargeReactor()
   if reactor and type(reactor.chargeReactor) == "function" then
     pcall(reactor.chargeReactor)
-    state.lastAction = "charge"
     setMessage("Charge requested")
   end
 end
@@ -497,7 +241,8 @@ end
 local function activateReactor()
   if reactor and type(reactor.activateReactor) == "function" then
     pcall(reactor.activateReactor)
-    state.lastAction = "activate"
+    state.startupHoldTicks = 120 -- ~24 seconds at 0.2 s loop
+    state.activatedByScript = true
     setMessage("Activate requested")
   end
 end
@@ -505,310 +250,444 @@ end
 local function stopReactor()
   if reactor and type(reactor.stopReactor) == "function" then
     pcall(reactor.stopReactor)
-    state.lastAction = "stop"
     setMessage("Stop requested")
   end
 end
 
 local function scram(reason)
   targetOutput = 0
-  targetInput = cfg.maxInput
-  writeGate(outputGate, 0, "output")
-  writeGate(inputGate, cfg.maxInput, "input")
+  targetInput = SETTINGS.maxInput
+  writeGate(outputGate, 0, SETTINGS.maxOutput, "output")
+  writeGate(inputGate, SETTINGS.maxInput, SETTINGS.maxInput, "input")
   stopReactor()
   setMessage("SCRAM: " .. tostring(reason))
 end
 
-local function updateAutoTargets(info)
+local function statusColor(status)
+  if status == "running" then return colors.lime end
+  if status == "warming_up" then return colors.orange end
+  if status == "stopping" then return colors.red end
+  if status == "cooling" then return colors.lightBlue end
+  return colors.lightGray
+end
+
+local function fieldColor(v)
+  if v >= SETTINGS.targetField then return colors.lime end
+  if v >= SETTINGS.minField then return colors.yellow end
+  return colors.red
+end
+
+local function satColor(v)
+  if v >= SETTINGS.targetSaturation then return colors.lime end
+  if v >= SETTINGS.minSaturation then return colors.yellow end
+  return colors.red
+end
+
+local function tempColor(v)
+  if v <= SETTINGS.targetTemp then return colors.lime end
+  if v <= SETTINGS.maxTemp then return colors.yellow end
+  return colors.red
+end
+
+local function drawText(x, y, s, tc, bc)
+  monitor.setCursorPos(x, y)
+  if bc then monitor.setBackgroundColor(bc) end
+  if tc then monitor.setTextColor(tc) end
+  monitor.write(s)
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.white)
+end
+
+local function drawBox(x1, y1, x2, y2, border, fill)
+  fill = fill or colors.black
+  for y = y1, y2 do
+    monitor.setCursorPos(x1, y)
+    for x = x1, x2 do
+      if y == y1 or y == y2 or x == x1 or x == x2 then
+        monitor.setBackgroundColor(border)
+      else
+        monitor.setBackgroundColor(fill)
+      end
+      monitor.write(" ")
+    end
+  end
+  monitor.setBackgroundColor(colors.black)
+end
+
+local function drawBar(x, y, w, value, maxValue, fg, bg)
+  local fill = 0
+  if maxValue > 0 then
+    fill = math.floor(clamp(value / maxValue, 0, 1) * w + 0.5)
+  end
+  monitor.setCursorPos(x, y)
+  for i = 1, w do
+    if i <= fill then
+      monitor.setBackgroundColor(fg)
+    else
+      monitor.setBackgroundColor(bg)
+    end
+    monitor.write(" ")
+  end
+  monitor.setBackgroundColor(colors.black)
+end
+
+local function addButton(id, x1, y1, x2, y2, label, callback, bg, fg)
+  table.insert(ui.buttons, {
+    id = id, x1 = x1, y1 = y1, x2 = x2, y2 = y2,
+    label = label, callback = callback, bg = bg or colors.gray, fg = fg or colors.white
+  })
+end
+
+local function drawButton(btn)
+  for y = btn.y1, btn.y2 do
+    monitor.setCursorPos(btn.x1, y)
+    monitor.setBackgroundColor(btn.bg)
+    monitor.setTextColor(btn.fg)
+    monitor.write(string.rep(" ", btn.x2 - btn.x1 + 1))
+  end
+  local cx = math.floor((btn.x1 + btn.x2 - #btn.label) / 2)
+  local cy = math.floor((btn.y1 + btn.y2) / 2)
+  drawText(cx, cy, btn.label, btn.fg, btn.bg)
+  monitor.setBackgroundColor(colors.black)
+  monitor.setTextColor(colors.white)
+end
+
+local function autoControl(info)
   local status = reactorStatus(info)
-  local fPct = fieldPct(info)
-  local sPct = satPct(info)
-  local temp = tonumber(info.temperature or 0)
+  local f = fieldPct(info)
+  local s = satPct(info)
+  local t = tonumber(info.temperature or 0)
   local drain = tonumber(info.fieldDrainRate or 0)
   local gen = tonumber(info.generationRate or 0)
 
-  local requiredForField = 0
-  local fieldTargetFrac = clamp(cfg.targetField / 100, 0.05, 0.95)
-  requiredForField = drain / (1 - fieldTargetFrac)
+  -- Required input to maintain current field against drain.
+  -- Keep a strong reserve during all phases to avoid a startup collapse.
+  local containmentReserve = math.max(drain * 1.30, drain + 250000)
 
   if status == "cold" then
-    targetOutput = 0
     targetInput = 0
+    targetOutput = 0
     return
   end
 
   if status == "warming_up" then
-    state.warmupTick = state.warmupTick + 1
     targetOutput = 0
 
-    local warmBoost = cfg.baseWarmupInput
-    if fPct < cfg.activateField then
-      warmBoost = warmBoost + (cfg.activateField - fPct) * 220000
-    end
-    if sPct < cfg.activateSaturation then
-      warmBoost = warmBoost + (cfg.activateSaturation - sPct) * 120000
-    end
-    if temp < cfg.activateTemp then
-      warmBoost = warmBoost + (cfg.activateTemp - temp) * 2200
-    end
+    local wanted = SETTINGS.warmupInputBase
+    wanted = wanted + math.max(0, SETTINGS.preActivateField - f) * 140000
+    wanted = wanted + math.max(0, SETTINGS.preActivateSaturation - s) * 100000
+    wanted = wanted + math.max(0, SETTINGS.preActivateTemp - t) * 1600
+    wanted = math.max(wanted, containmentReserve + 100000)
+    targetInput = clamp(wanted, SETTINGS.minInput, SETTINGS.warmupInputMax)
 
-    targetInput = clamp(math.max(requiredForField + 50000, warmBoost), cfg.minInput, cfg.maxInput)
-
-    if cfg.autoActivate
-      and fPct >= cfg.activateField
-      and sPct >= cfg.activateSaturation
-      and temp >= cfg.activateTemp then
+    if SETTINGS.autoActivate
+      and f >= SETTINGS.preActivateField
+      and s >= SETTINGS.preActivateSaturation
+      and t >= SETTINGS.preActivateTemp then
       activateReactor()
     end
     return
   end
 
   if status == "running" then
-    state.runningTick = state.runningTick + 1
+    -- Startup stabilization window after activation:
+    -- keep output shut and overfeed input a bit so field and saturation can climb
+    -- above their post-activation values safely.
+    if state.startupHoldTicks > 0 then
+      state.startupHoldTicks = state.startupHoldTicks - 1
+      targetOutput = 0
 
-    local fieldErr = cfg.targetField - fPct
-    local satErr = cfg.targetSaturation - sPct
-    local tempErr = cfg.targetTemp - temp
+      local wanted = containmentReserve + 500000
+      if f < 42 then wanted = wanted + (42 - f) * 250000 end
+      if s < 40 then wanted = wanted + (40 - s) * 200000 end
+      if t < 4000 then wanted = wanted + (4000 - t) * 1200 end
 
-    local inputBias = requiredForField
-    inputBias = inputBias + fieldErr * 180000
-    inputBias = inputBias + satErr * 50000
-    if temp > cfg.targetTemp then
-      inputBias = inputBias + (temp - cfg.targetTemp) * 3500
+      targetInput = clamp(wanted, SETTINGS.minInput, SETTINGS.maxInput)
+
+      if f >= SETTINGS.targetField and s >= 45 and t >= 4500 then
+        state.startupHoldTicks = 0
+      end
+      return
     end
-    targetInput = clamp(inputBias, cfg.minInput, cfg.maxInput)
 
-    local reserve = requiredForField * 0.15 + 50000
+    local fieldErr = SETTINGS.targetField - f
+    local satErr = SETTINGS.targetSaturation - s
+    local tempErr = SETTINGS.targetTemp - t
+
+    local wantedInput = containmentReserve
+    wantedInput = wantedInput + fieldErr * 180000
+    wantedInput = wantedInput + satErr * 70000
+
+    if t > SETTINGS.targetTemp then
+      wantedInput = wantedInput + (t - SETTINGS.targetTemp) * 3500
+    elseif t < SETTINGS.targetTemp - 600 then
+      wantedInput = wantedInput - 100000
+    end
+
+    targetInput = clamp(wantedInput, SETTINGS.minInput, SETTINGS.maxInput)
+
+    -- Conservative output ramp:
+    -- only increase output when field/sat are healthy and temperature is in range.
     local desiredOutput = currentOutput
 
-    if temp < cfg.targetTemp - 400 and sPct > cfg.minSaturation + 8 and fPct > cfg.minField + 8 then
-      desiredOutput = desiredOutput + cfg.outputRampPerTick * 1.6
-    elseif sPct > cfg.targetSaturation + 8 and fPct > cfg.targetField + 5 then
-      desiredOutput = desiredOutput + cfg.outputRampPerTick
-    elseif sPct < cfg.targetSaturation - 5 or fPct < cfg.targetField - 5 then
-      desiredOutput = desiredOutput - cfg.outputRampPerTick * 1.5
+    if f > SETTINGS.targetField + 3 and s > SETTINGS.targetSaturation + 5 and t < SETTINGS.targetTemp - 250 then
+      desiredOutput = desiredOutput + SETTINGS.outputRampPerTick
+    elseif s < SETTINGS.targetSaturation - 4 or f < SETTINGS.targetField - 3 then
+      desiredOutput = desiredOutput - SETTINGS.outputRampPerTick * 2
+    elseif t > SETTINGS.targetTemp + 100 then
+      desiredOutput = desiredOutput - SETTINGS.outputRampPerTick * 2
     end
 
-    if temp > cfg.targetTemp + 150 then
-      desiredOutput = desiredOutput - cfg.outputRampPerTick * 2.0
-    end
-    if temp > cfg.maxTemp - 75 then
-      desiredOutput = math.min(desiredOutput, math.max(0, gen - reserve - 500000))
-    end
-    if sPct < cfg.minSaturation + 3 or fPct < cfg.minField + 3 then
-      desiredOutput = math.min(desiredOutput, math.max(0, gen - reserve - 250000))
+    -- Never try to extract too close to generation while reactor is marginal.
+    local safeCap = math.max(0, gen - math.max(400000, containmentReserve * 0.20))
+    if f < SETTINGS.targetField or s < SETTINGS.targetSaturation then
+      safeCap = math.max(0, gen - math.max(700000, containmentReserve * 0.35))
     end
 
-    desiredOutput = clamp(desiredOutput, cfg.minOutput, cfg.maxOutput)
-    targetOutput = desiredOutput
+    targetOutput = clamp(math.min(desiredOutput, safeCap), SETTINGS.minOutput, SETTINGS.maxOutput)
     return
   end
 
   if status == "cooling" or status == "stopping" then
     targetOutput = 0
-    targetInput = clamp(requiredForField, 0, cfg.maxInput)
+    targetInput = clamp(containmentReserve, SETTINGS.minInput, SETTINGS.maxInput)
     return
   end
 
+  targetInput = clamp(containmentReserve, SETTINGS.minInput, SETTINGS.maxInput)
   targetOutput = 0
-  targetInput = clamp(requiredForField, 0, cfg.maxInput)
 end
 
 local function safetyChecks(info)
   local status = reactorStatus(info)
-  local fPct = fieldPct(info)
-  local sPct = satPct(info)
-  local temp = tonumber(info.temperature or 0)
+  local f = fieldPct(info)
+  local s = satPct(info)
+  local t = tonumber(info.temperature or 0)
 
   if status == "running" then
-    if fPct < cfg.minField then
-      scram("field below min")
-      return
+    if f < SETTINGS.minField then
+      scram("field below minimum")
+      return false
     end
-    if sPct < cfg.minSaturation then
-      scram("saturation below min")
-      return
+    if s < SETTINGS.minSaturation then
+      scram("saturation below minimum")
+      return false
     end
-    if temp > cfg.maxTemp then
-      scram("temperature above max")
-      return
+    if t > SETTINGS.maxTemp then
+      scram("temperature above maximum")
+      return false
     end
   end
 
   if state.lastFieldPct and status == "running" then
-    if fPct < state.lastFieldPct - 2.0 and currentInput >= (cfg.maxInput * 0.9) then
-      state.fieldDropTicks = state.fieldDropTicks + 1
-    else
-      state.fieldDropTicks = 0
+    -- Extra anti-lock checks:
+    -- if field or saturation free-fall while we're already pushing hard, SCRAM.
+    if f < state.lastFieldPct - 3 and currentInput >= SETTINGS.maxInput * 0.85 then
+      scram("field collapse / input lock suspected")
+      return false
     end
-
-    if sPct < state.lastSatPct - 3.0 and currentOutput > 0 and currentInput >= (cfg.maxInput * 0.5) then
-      state.satDropTicks = state.satDropTicks + 1
-    else
-      state.satDropTicks = 0
-    end
-
-    if temp > cfg.maxTemp - 50 then
-      state.overTempTicks = state.overTempTicks + 1
-    else
-      state.overTempTicks = 0
-    end
-
-    if state.fieldDropTicks >= 8 then
-      scram("field collapsing / input locked?")
-      return
-    end
-    if state.satDropTicks >= 8 then
-      scram("saturation collapsing")
-      return
-    end
-    if state.overTempTicks >= 10 then
-      scram("persistent overtemp")
-      return
+    if s < state.lastSatPct - 4 and currentOutput > 0 and currentInput >= SETTINGS.maxInput * 0.50 then
+      scram("saturation collapse")
+      return false
     end
   end
 
-  state.lastFieldPct = fPct
-  state.lastSatPct = sPct
-  state.lastTemp = temp
+  state.lastFieldPct = f
+  state.lastSatPct = s
+  state.lastTemp = t
 
   if state.gateWriteFailures >= 6 then
-    inputGate = wrapPeripheral(cfg.inputGateName, "flow_gate")
-    outputGate = wrapPeripheral(cfg.outputGateName, "flow_gate")
+    inputGate = wrapFlowGate(INPUT_GATE_NAME)
+    outputGate = wrapFlowGate(OUTPUT_GATE_NAME)
     if not inputGate or not outputGate then
-      scram("lost gate peripheral")
-      return
+      scram("lost flow gate peripheral")
+      return false
     end
   end
+
+  return true
 end
 
 local function applyControl(info)
-  if cfg.mode == "auto" then
-    updateAutoTargets(info)
+  if SETTINGS.mode == "auto" then
+    autoControl(info)
   else
-    targetInput = clamp(cfg.manualInput, cfg.minInput, cfg.maxInput)
-    targetOutput = clamp(cfg.manualOutput, cfg.minOutput, cfg.maxOutput)
+    targetInput = clamp(SETTINGS.manualInput, SETTINGS.minInput, SETTINGS.maxInput)
+    targetOutput = clamp(SETTINGS.manualOutput, SETTINGS.minOutput, SETTINGS.maxOutput)
   end
 
-  local newInput = smoothStep(currentInput, targetInput, cfg.inputRampPerTick)
-  local newOutput = smoothStep(currentOutput, targetOutput, cfg.outputRampPerTick)
+  local nextInput = smoothStep(currentInput, targetInput, SETTINGS.inputRampPerTick)
+  local nextOutput = smoothStep(currentOutput, targetOutput, SETTINGS.outputRampPerTick)
 
-  writeGate(inputGate, newInput, "input")
-  writeGate(outputGate, newOutput, "output")
+  writeGate(inputGate, nextInput, SETTINGS.maxInput, "input")
+  writeGate(outputGate, nextOutput, SETTINGS.maxOutput, "output")
+end
+
+local function addAdjustButtons(key, label, y, small, big, minV, maxV)
+  drawText(3, y, label, colors.white)
+  drawText(monW - 10, y, tostring(round(SETTINGS[key], 1)), colors.cyan)
+
+  addButton(key .. "_mb", 3,  y + 1, 9,  y + 2, "-big", function()
+    SETTINGS[key] = clamp(SETTINGS[key] - big, minV, maxV)
+  end, colors.red)
+  addButton(key .. "_ms", 11, y + 1, 17, y + 2, "-sm", function()
+    SETTINGS[key] = clamp(SETTINGS[key] - small, minV, maxV)
+  end, colors.orange)
+  addButton(key .. "_ps", 19, y + 1, 25, y + 2, "+sm", function()
+    SETTINGS[key] = clamp(SETTINGS[key] + small, minV, maxV)
+  end, colors.lime)
+  addButton(key .. "_pb", 27, y + 1, 33, y + 2, "+big", function()
+    SETTINGS[key] = clamp(SETTINGS[key] + big, minV, maxV)
+  end, colors.green)
 end
 
 local function drawMain(info)
   ui.buttons = {}
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
 
   drawBox(1, 1, monW, monH, colors.gray, colors.black)
-  text(3, 1, " Draconic Reactor Ctrl v" .. VERSION .. " ", colors.white, colors.gray)
+  drawText(3, 1, " Reactor Ctrl " .. VERSION .. " ", colors.white, colors.gray)
 
   local status = reactorStatus(info)
-  local fPct = round(fieldPct(info), 1)
-  local sPct = round(satPct(info), 1)
-  local temp = tonumber(info.temperature or 0)
+  local f = round(fieldPct(info), 1)
+  local s = round(satPct(info), 1)
+  local t = tonumber(info.temperature or 0)
   local fuel = round(fuelPct(info), 1)
   local gen = tonumber(info.generationRate or 0)
   local drain = tonumber(info.fieldDrainRate or 0)
 
-  text(3, 3, "Status: " .. status, statusColor(status))
-  text(3, 4, "Mode:   " .. tostring(cfg.mode), cfg.mode == "auto" and colors.lime or colors.yellow)
-  text(3, 5, "Gen:    " .. fmtInt(gen) .. " FE/t", colors.white)
-  text(3, 6, "Drain:  " .. fmtInt(drain) .. " FE/t", colors.white)
+  drawText(3, 3, "Status: " .. status, statusColor(status))
+  drawText(3, 4, "Mode:   " .. SETTINGS.mode, SETTINGS.mode == "auto" and colors.lime or colors.yellow)
+  drawText(3, 5, "Gen:    " .. fmtInt(gen) .. " FE/t", colors.white)
+  drawText(3, 6, "Drain:  " .. fmtInt(drain) .. " FE/t", colors.white)
 
-  text(3, 8, "Temperature: " .. fmtInt(temp) .. " C", tempColor(temp))
-  bar(3, 9, monW - 6, math.min(temp, cfg.maxTemp), cfg.maxTemp, tempColor(temp), colors.gray)
+  drawText(3, 8,  "Temperature: " .. fmtInt(t) .. " C", tempColor(t))
+  drawBar (3, 9,  monW - 6, math.min(t, SETTINGS.maxTemp), SETTINGS.maxTemp, tempColor(t), colors.gray)
 
-  text(3, 11, "Field:       " .. tostring(fPct) .. "%", fieldColor(fPct))
-  bar(3, 12, monW - 6, fPct, 100, fieldColor(fPct), colors.gray)
+  drawText(3, 11, "Field:       " .. f .. "%", fieldColor(f))
+  drawBar (3, 12, monW - 6, f, 100, fieldColor(f), colors.gray)
 
-  text(3, 14, "Saturation:  " .. tostring(sPct) .. "%", satColor(sPct))
-  bar(3, 15, monW - 6, sPct, 100, satColor(sPct), colors.gray)
+  drawText(3, 14, "Saturation:  " .. s .. "%", satColor(s))
+  drawBar (3, 15, monW - 6, s, 100, satColor(s), colors.gray)
 
-  text(3, 17, "Fuel left:   " .. tostring(fuel) .. "%", fuel > 25 and colors.lime or colors.yellow)
+  drawText(3, 17, "Fuel left:   " .. fuel .. "%", fuel > 25 and colors.lime or colors.yellow)
+  drawText(3, 18, "Input gate:  " .. fmtInt(currentInput), colors.cyan)
+  drawText(3, 19, "Output gate: " .. fmtInt(currentOutput), colors.cyan)
+  drawText(3, 20, "Targets I/O: " .. fmtInt(targetInput) .. " / " .. fmtInt(targetOutput), colors.lightBlue)
 
-  text(3, 19, "Input gate:  " .. fmtInt(currentInput), colors.cyan)
-  text(3, 20, "Output gate: " .. fmtInt(currentOutput), colors.cyan)
+  local buttonY1 = math.max(22, monH - 7)
+  local buttonY2 = buttonY1 + 2
+  local buttonY3 = buttonY2 + 1
+  local buttonY4 = buttonY3 + 2
 
-  text(3, 22, "Auto target in/out: " .. fmtInt(targetInput) .. " / " .. fmtInt(targetOutput), colors.lightBlue)
-  clearLine(monH - 1)
-  text(3, monH - 1, "Msg: " .. tostring(ui.message), colors.white)
+  addButton("charge", 3,  buttonY1, 12, buttonY2, "CHARGE", function() chargeReactor() end, colors.blue)
+  addButton("activate", 14, buttonY1, 25, buttonY2, "ACTIVATE", function() activateReactor() end, colors.green)
+  addButton("scram", 27, buttonY1, 36, buttonY2, "SCRAM", function() scram("manual button") end, colors.red)
 
-  addButton("charge",   3, 24, 12, 26, "CHARGE", function() chargeReactor() end, colors.blue)
-  addButton("activate", 14, 24, 25, 26, "ACTIVATE", function() activateReactor() end, colors.green)
-  addButton("scram",   27, 24, 36, 26, "SCRAM", function() scram("manual button") end, colors.red)
-  addButton("tuning",   3, 28, 14, 30, "TUNING", function() ui.screen = "tuning" end, colors.purple)
-  addButton("mode",    16, 28, 28, 30, cfg.mode == "auto" and "SET MANUAL" or "SET AUTO", function()
-    cfg.mode = (cfg.mode == "auto") and "manual" or "auto"
-    saveConfig()
-    setMessage("Mode -> " .. cfg.mode)
-  end, colors.brown)
+  addButton("tuning", 3,  buttonY3, 14, buttonY4, "TUNING", function()
+    ui.screen = "tuning"
+    setMessage("Opened tuning")
+  end, colors.purple)
 
-  for _, btn in ipairs(ui.buttons) do drawButton(btn) end
+  addButton("mode", 16, buttonY3, 31, buttonY4,
+    SETTINGS.mode == "auto" and "SET MANUAL" or "SET AUTO",
+    function()
+      if SETTINGS.mode == "auto" then
+        SETTINGS.mode = "manual"
+        setMessage("Manual mode enabled")
+      else
+        SETTINGS.mode = "auto"
+        setMessage("Auto mode enabled")
+      end
+    end,
+    colors.brown
+  )
+
+  for _, btn in ipairs(ui.buttons) do
+    drawButton(btn)
+  end
+
+  drawText(3, monH - 1, "Msg: " .. ui.message, colors.white)
 end
 
 local function drawTuning(info)
   ui.buttons = {}
-  mon.setBackgroundColor(colors.black)
-  mon.clear()
+  monitor.setBackgroundColor(colors.black)
+  monitor.clear()
+
   drawBox(1, 1, monW, monH, colors.gray, colors.black)
-  text(3, 1, " Tuning ", colors.white, colors.gray)
-  text(3, 3, "Mode: " .. cfg.mode, cfg.mode == "auto" and colors.lime or colors.yellow)
+  drawText(3, 1, " Tuning ", colors.white, colors.gray)
+  drawText(3, 3, "Mode: " .. SETTINGS.mode, SETTINGS.mode == "auto" and colors.lime or colors.yellow)
 
   local row = 5
-  addParamButtons("targetField",      "Target Field %", row, 1, 5, 20, 80); row = row + 4
-  addParamButtons("minField",         "Min Field %", row,    1, 5, 5, 60); row = row + 4
-  addParamButtons("targetSaturation", "Target Sat %", row,   1, 5, 10, 90); row = row + 4
-  addParamButtons("minSaturation",    "Min Sat %", row,      1, 5, 5, 50); row = row + 4
+  addAdjustButtons("targetField", "Target Field %", row, 1, 5, 20, 70); row = row + 4
+  addAdjustButtons("minField", "Min Field %", row, 1, 5, 5, 60); row = row + 4
+  addAdjustButtons("targetSaturation", "Target Sat %", row, 1, 5, 20, 90); row = row + 4
+  addAdjustButtons("minSaturation", "Min Sat %", row, 1, 5, 5, 50); row = row + 4
+  addAdjustButtons("targetTemp", "Target Temp", row, 50, 250, 3000, 7900); row = row + 4
+  addAdjustButtons("maxTemp", "Max Temp", row, 50, 250, 5000, 7990); row = row + 4
 
-  if monH >= row + 8 then
-    addParamButtons("targetTemp", "Target Temp", row, 50, 250, 3000, 7900); row = row + 4
-    addParamButtons("maxTemp",    "Max Temp", row,    50, 250, 5000, 7990); row = row + 4
-  end
-
-  if monH >= row + 4 then
-    text(3, row, "Manual Input", colors.white)
-    text(monW - 16, row, fmtInt(cfg.manualInput), colors.cyan)
-    addButton("mi_dec", 3, row + 1, 10, row + 2, "-250k", function()
-      cfg.manualInput = clamp(cfg.manualInput - 250000, cfg.minInput, cfg.maxInput)
-      saveConfig()
+  if row + 7 <= monH - 4 then
+    drawText(3, row, "Manual Input", colors.white)
+    drawText(monW - 14, row, fmtInt(SETTINGS.manualInput), colors.cyan)
+    addButton("mi_dec", 3, row + 1, 12, row + 2, "-250k", function()
+      SETTINGS.manualInput = clamp(SETTINGS.manualInput - 250000, SETTINGS.minInput, SETTINGS.maxInput)
     end, colors.red)
-    addButton("mi_inc", 12, row + 1, 19, row + 2, "+250k", function()
-      cfg.manualInput = clamp(cfg.manualInput + 250000, cfg.minInput, cfg.maxInput)
-      saveConfig()
+    addButton("mi_inc", 14, row + 1, 23, row + 2, "+250k", function()
+      SETTINGS.manualInput = clamp(SETTINGS.manualInput + 250000, SETTINGS.minInput, SETTINGS.maxInput)
     end, colors.green)
 
-    text(22, row, "Manual Output", colors.white)
-    text(monW - 16, row + 3, fmtInt(cfg.manualOutput), colors.cyan)
-    addButton("mo_dec", 22, row + 1, 30, row + 2, "-250k", function()
-      cfg.manualOutput = clamp(cfg.manualOutput - 250000, cfg.minOutput, cfg.maxOutput)
-      saveConfig()
+    drawText(25, row, "Manual Output", colors.white)
+    drawText(monW - 14, row + 3, fmtInt(SETTINGS.manualOutput), colors.cyan)
+    addButton("mo_dec", 25, row + 1, 34, row + 2, "-250k", function()
+      SETTINGS.manualOutput = clamp(SETTINGS.manualOutput - 250000, SETTINGS.minOutput, SETTINGS.maxOutput)
     end, colors.red)
-    addButton("mo_inc", 32, row + 1, 40, row + 2, "+250k", function()
-      cfg.manualOutput = clamp(cfg.manualOutput + 250000, cfg.minOutput, cfg.maxOutput)
-      saveConfig()
+    addButton("mo_inc", 36, row + 1, 45, row + 2, "+250k", function()
+      SETTINGS.manualOutput = clamp(SETTINGS.manualOutput + 250000, SETTINGS.minOutput, SETTINGS.maxOutput)
     end, colors.green)
-    row = row + 5
   end
 
-  addButton("back", 3, monH - 3, 12, monH - 2, "BACK", function() ui.screen = "main" end, colors.blue)
-  addButton("autoAct", 14, monH - 3, 27, monH - 2,
-    cfg.autoActivate and "AUTO ACT: ON" or "AUTO ACT: OFF",
+  addButton("back", 3, monH - 3, 12, monH - 2, "BACK", function()
+    ui.screen = "main"
+    setMessage("Returned to main")
+  end, colors.blue)
+
+  addButton("mode", 14, monH - 3, 29, monH - 2,
+    SETTINGS.mode == "auto" and "SET MANUAL" or "SET AUTO",
     function()
-      cfg.autoActivate = not cfg.autoActivate
-      saveConfig()
+      if SETTINGS.mode == "auto" then
+        SETTINGS.mode = "manual"
+        setMessage("Manual mode enabled")
+      else
+        SETTINGS.mode = "auto"
+        setMessage("Auto mode enabled")
+      end
     end,
-    cfg.autoActivate and colors.green or colors.red
+    colors.brown
   )
 
-  for _, btn in ipairs(ui.buttons) do drawButton(btn) end
-  clearLine(monH - 1)
-  text(3, monH - 1, "Field/Sat/Temp manual targets are saved instantly.", colors.white)
+  for _, btn in ipairs(ui.buttons) do
+    drawButton(btn)
+  end
+
+  drawText(3, monH - 1, "No cfg file is created. Settings reset on restart.", colors.white)
 end
 
-local function redraw(info)
+local function redraw()
+  local info = state.lastInfo or {
+    status = "unknown",
+    temperature = 0,
+    fieldStrength = 0,
+    maxFieldStrength = 1,
+    energySaturation = 0,
+    maxEnergySaturation = 1,
+    fuelConversion = 0,
+    maxFuelConversion = 1,
+    generationRate = 0,
+    fieldDrainRate = 0
+  }
+
   if ui.screen == "tuning" then
     drawTuning(info)
   else
@@ -816,7 +695,7 @@ local function redraw(info)
   end
 end
 
-local function handleTouch(side, x, y)
+local function handlePress(x, y)
   for _, btn in ipairs(ui.buttons) do
     if x >= btn.x1 and x <= btn.x2 and y >= btn.y1 and y <= btn.y2 then
       btn.callback()
@@ -825,22 +704,41 @@ local function handleTouch(side, x, y)
   end
 end
 
-local function uiLoop()
+local function setup()
   while true do
-    local info = state.lastInfo or getInfo() or {
-      status = "unknown",
-      temperature = 0,
-      fieldStrength = 0,
-      maxFieldStrength = 1,
-      energySaturation = 0,
-      maxEnergySaturation = 1,
-      fuelConversion = 0,
-      maxFuelConversion = 1,
-      generationRate = 0,
-      fieldDrainRate = 0
-    }
-    redraw(info)
-    sleep(0.2)
+    reactor = select(1, detectReactor())
+    monitor = select(1, detectLargestMonitor())
+    inputGate = wrapFlowGate(INPUT_GATE_NAME)
+    outputGate = wrapFlowGate(OUTPUT_GATE_NAME)
+
+    if monitor then
+      pcall(monitor.setTextScale, SETTINGS.monitorScale)
+      monitor.setBackgroundColor(colors.black)
+      monitor.setTextColor(colors.white)
+      monitor.clear()
+      monW, monH = monitor.getSize()
+    end
+
+    if reactor and monitor and inputGate and outputGate then
+      currentInput = readGate(inputGate) or 0
+      currentOutput = readGate(outputGate) or 0
+      setMessage("Ready")
+      return
+    end
+
+    term.setBackgroundColor(colors.black)
+    term.setTextColor(colors.white)
+    term.clear()
+    term.setCursorPos(1, 1)
+    print("Waiting for peripherals...")
+    print("")
+    print("Need reactor: " .. tostring(reactor ~= nil))
+    print("Need monitor: " .. tostring(monitor ~= nil))
+    print("Need input gate (" .. INPUT_GATE_NAME .. "): " .. tostring(inputGate ~= nil))
+    print("Need output gate (" .. OUTPUT_GATE_NAME .. "): " .. tostring(outputGate ~= nil))
+    print("")
+    print("Edit the two gate names at the top of the file if needed.")
+    sleep(2)
   end
 end
 
@@ -849,19 +747,27 @@ local function controlLoop()
     local info = getInfo()
     if not info then
       state.staleInfoCount = state.staleInfoCount + 1
-      setMessage("No reactor info; retrying...")
+      setMessage("Reactor info unavailable")
       if state.staleInfoCount >= 10 then
-        scram("reactor info stale")
-        detectPeripherals()
+        scram("stale reactor info")
+        reactor = select(1, detectReactor())
       end
       sleep(0.2)
     else
       state.staleInfoCount = 0
       state.lastInfo = info
-      safetyChecks(info)
-      applyControl(info)
+      if safetyChecks(info) then
+        applyControl(info)
+      end
       sleep(0.2)
     end
+  end
+end
+
+local function uiLoop()
+  while true do
+    redraw()
+    sleep(0.15)
   end
 end
 
@@ -869,20 +775,23 @@ local function eventLoop()
   while true do
     local e, p1, p2, p3 = os.pullEvent()
     if e == "monitor_touch" then
-      handleTouch(p1, p2, p3)
+      handlePress(p2, p3)
+    elseif e == "mouse_click" then
+      -- allows local terminal mouse if monitor isn't convenient
+      handlePress(p2, p3)
     elseif e == "peripheral" or e == "peripheral_detach" then
-      detectPeripherals()
-      setMessage("Peripherals refreshed")
-    elseif e == "char" then
-      if p1 == "q" or p1 == "Q" then
-        scram("keyboard quit")
+      reactor = select(1, detectReactor())
+      monitor = select(1, detectLargestMonitor())
+      inputGate = wrapFlowGate(INPUT_GATE_NAME)
+      outputGate = wrapFlowGate(OUTPUT_GATE_NAME)
+      if monitor then
+        pcall(monitor.setTextScale, SETTINGS.monitorScale)
+        monW, monH = monitor.getSize()
       end
+      setMessage("Peripherals refreshed")
     end
   end
 end
 
-ensureSetup()
-setMessage("Ready")
-if not loadConfig() then saveConfig() end
-
-parallel.waitForAny(uiLoop, controlLoop, eventLoop)
+setup()
+parallel.waitForAny(controlLoop, uiLoop, eventLoop)
