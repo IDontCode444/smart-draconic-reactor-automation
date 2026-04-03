@@ -1,5 +1,5 @@
 -- Draconic Reactor Auto Controller for CC:Tweaked
--- Revised version: fixes flux gate live-flow display
+-- ATM10 / Draconic Evolution
 --
 -- Named peripherals expected:
 --   reactor:     draconic_reactor_0
@@ -7,16 +7,25 @@
 --   output gate: flow_gate_1
 --
 -- Monitor is auto-detected.
+--
+-- Main improvements in this revision:
+-- - Fixes false SCRAM during CHARGE
+-- - Cleaner UI
+-- - Separate live-flow and setpoint display
+-- - Dual PI control (input + output)
+-- - Safer state handling
+-- - Larger output target increments up to 10B rf/t
+-- - Buffered rendering to reduce flicker
 
 -------------------------
--- USER EDITABLE NAMES  --
+-- USER EDITABLE NAMES --
 -------------------------
 local NAMED_REACTOR     = "draconic_reactor_0"
 local NAMED_INPUT_GATE  = "flow_gate_0"
 local NAMED_OUTPUT_GATE = "flow_gate_1"
 
 -------------------------
--- DEFAULT SETTINGS    --
+-- DEFAULT SETTINGS   --
 -------------------------
 local CONFIG_FILE = "draconic_reactor_auto.cfg"
 
@@ -24,39 +33,60 @@ local defaults = {
   monitorTextScale = 0.5,
 
   targets = {
-    temp   = 7800,
-    field  = 45,
-    sat    = 25,
-    output = 10000000,
+    temp   = 7800,          -- preferred running temp
+    field  = 50,            -- safer default for aggressive output
+    sat    = 30,            -- keep some buffer
+    output = 10000000,      -- 10M rf/t initial cap
   },
 
   limits = {
+    minFieldWarn     = 18,
     minFieldThrottle = 22,
     minFieldScram    = 10,
+
+    minSatWarn       = 10,
     minSatThrottle   = 8,
     minSatScram      = 3,
+
+    maxTempWarn      = 7900,
     maxTempThrottle  = 8050,
     maxTempScram     = 8400,
   },
 
   control = {
-    loopDelay          = 0.25,
-    uiDelay            = 0.10,
-    chargeFlow         = 5000000,
-    fieldSafetyMargin  = 1.10,
-    fieldCorrection    = 0.12,
-    outputRampFraction = 0.06,
-    outputStepMin      = 10000,
-    outputStepMax      = 5000000,
-    saveEverySeconds   = 5,
+    loopDelay        = 0.20,
+    uiDelay          = 0.10,
+    chargeFlow       = 8000000, -- stronger default for charge-up
+    saveEverySeconds = 5,
+
+    -- input PI controller
+    inKp = 0.20,
+    inKi = 0.010,
+    inIntegralMin = -50000000,
+    inIntegralMax =  50000000,
+    inSlewUp      = 2500000,
+    inSlewDown    = 3500000,
+
+    -- output PI controller
+    outKp = 0.070,
+    outKi = 0.004,
+    outIntegralMin = -1000000000,
+    outIntegralMax =  1000000000,
+    outSlewUp      = 5000000,
+    outSlewDown    = 12000000,
+
+    -- additional shaping
+    startupOutputFraction = 0.20,
+    startupTemp = 2500,
+    startupOutputHoldTemp = 2200,
   }
 }
 
 -------------------------
--- STATE               --
+-- STATE              --
 -------------------------
 local reactor, inputGate, outputGate, monitor, monitorName
-local settings = nil
+local settings
 
 local state = {
   page = "main",
@@ -66,10 +96,29 @@ local state = {
   running = true,
   scrammed = false,
   message = "Booting...",
+
+  setpoints = {
+    input = 0,
+    output = 0,
+  },
+
+  live = {
+    input = 0,
+    output = 0,
+  },
+
+  pid = {
+    inputIntegral = 0,
+    outputIntegral = 0,
+  },
+
+  prev = {
+    status = "unknown",
+  }
 }
 
 -------------------------
--- SMALL HELPERS       --
+-- HELPERS            --
 -------------------------
 local function clamp(v, lo, hi)
   if v < lo then return lo end
@@ -110,9 +159,14 @@ local function deepMerge(dst, src)
   return dst
 end
 
+local function hasMethod(obj, name)
+  return obj and type(obj[name]) == "function"
+end
+
 local function fmtRF(n)
   n = tonumber(n) or 0
   local abs = math.abs(n)
+
   if abs >= 1000000000000 then
     return string.format("%.2fT", n / 1000000000000)
   elseif abs >= 1000000000 then
@@ -132,16 +186,26 @@ local function centerText(width, txt)
   return string.rep(" ", left) .. txt .. string.rep(" ", width - left - #txt)
 end
 
-local function hasMethod(obj, name)
-  return obj and type(obj[name]) == "function"
+local function slew(current, target, upStep, downStep)
+  if target > current then
+    return math.min(target, current + upStep)
+  elseif target < current then
+    return math.max(target, current - downStep)
+  else
+    return current
+  end
+end
+
+local function resetPID()
+  state.pid.inputIntegral = 0
+  state.pid.outputIntegral = 0
 end
 
 -------------------------
--- CONFIG              --
+-- CONFIG             --
 -------------------------
 local function loadSettings()
   settings = copyTable(defaults)
-
   if fs.exists(CONFIG_FILE) then
     local f = fs.open(CONFIG_FILE, "r")
     if f then
@@ -170,7 +234,7 @@ local function saveSettings(force)
 end
 
 -------------------------
--- PERIPHERALS         --
+-- PERIPHERALS        --
 -------------------------
 local function wrapRequired(name, fallbackType)
   local p = peripheral.wrap(name)
@@ -204,7 +268,6 @@ local function initPeripherals()
   if hasMethod(monitor, "setTextScale") then
     monitor.setTextScale(settings.monitorTextScale or 0.5)
   end
-
   if hasMethod(monitor, "setBackgroundColor") then
     monitor.setBackgroundColor(colors.black)
   end
@@ -224,11 +287,10 @@ local function initPeripherals()
 end
 
 -------------------------
--- GATE COMPAT LAYER   --
+-- GATE API           --
 -------------------------
--- IMPORTANT:
--- getFlow() = live current transfer
--- other getters are often config/override values
+-- Use getFlow() as live measured flow when available.
+-- Use setFlowOverride() as the commanded setpoint when available.
 
 local function setGateFlow(gate, value)
   value = math.max(0, round(tonumber(value) or 0))
@@ -240,19 +302,7 @@ local function setGateFlow(gate, value)
   elseif hasMethod(gate, "setFlow") then
     return gate.setFlow(value)
   else
-    error("Gate does not support a known set flow method")
-  end
-end
-
-local function getGateFlowSetpoint(gate)
-  if hasMethod(gate, "getFlowOverride") then
-    return tonumber(gate.getFlowOverride()) or 0
-  elseif hasMethod(gate, "getSignalLowFlow") then
-    return tonumber(gate.getSignalLowFlow()) or 0
-  elseif hasMethod(gate, "getFlow") then
-    return tonumber(gate.getFlow()) or 0
-  else
-    return 0
+    error("Gate missing supported setter")
   end
 end
 
@@ -268,8 +318,20 @@ local function getGateLiveFlow(gate)
   end
 end
 
+local function getGateSetpoint(gate, fallback)
+  if hasMethod(gate, "getFlowOverride") then
+    return tonumber(gate.getFlowOverride()) or fallback or 0
+  elseif hasMethod(gate, "getSignalLowFlow") then
+    return tonumber(gate.getSignalLowFlow()) or fallback or 0
+  elseif hasMethod(gate, "getFlow") then
+    return tonumber(gate.getFlow()) or fallback or 0
+  else
+    return fallback or 0
+  end
+end
+
 -------------------------
--- REACTOR COMPAT      --
+-- REACTOR API        --
 -------------------------
 local function reactorInfo()
   if hasMethod(reactor, "getReactorInfo") then
@@ -282,26 +344,22 @@ local function reactorCharge()
   if hasMethod(reactor, "chargeReactor") then
     return reactor.chargeReactor()
   end
-  state.message = "chargeReactor() not available"
 end
 
 local function reactorActivate()
   if hasMethod(reactor, "activateReactor") then
-    state.scrammed = false
     return reactor.activateReactor()
   end
-  state.message = "activateReactor() not available"
 end
 
 local function reactorStop()
   if hasMethod(reactor, "stopReactor") then
     return reactor.stopReactor()
   end
-  state.message = "stopReactor() not available"
 end
 
 -------------------------
--- REACTOR MATH        --
+-- REACTOR MODEL      --
 -------------------------
 local function computeTempDrainFactor(temp)
   if temp > 8000 then
@@ -364,79 +422,143 @@ local function isRunningLike(status)
 end
 
 local function isChargingLike(status)
-  return status == "charging" or status == "charged" or status == "warming_up"
+  return status == "charging" or status == "charged"
+end
+
+local function isWarmingLike(status)
+  return status == "warming_up"
 end
 
 local function isStoppingLike(status)
   return status == "stopping" or status == "cooling"
 end
 
+local function isPreActive(status)
+  return isChargingLike(status) or isWarmingLike(status)
+end
+
 -------------------------
--- CONTROL LOGIC       --
+-- CONTROL            --
 -------------------------
-local function calcWantedInput(info)
+local function applyInputSetpoint(value)
+  value = math.max(0, round(value))
+  state.setpoints.input = value
+  pcall(setGateFlow, inputGate, value)
+end
+
+local function applyOutputSetpoint(value)
+  value = math.max(0, round(value))
+  state.setpoints.output = value
+  pcall(setGateFlow, outputGate, value)
+end
+
+local function inputPI(info)
   local targetFieldPct = clamp(settings.targets.field, 20, 80)
   local targetField = info.maxFieldStrength * (targetFieldPct / 100)
 
-  local fieldNegPct = 1 - (targetField / info.maxFieldStrength)
-  fieldNegPct = math.max(0.01, fieldNegPct)
-
-  local base = (info.fieldDrainRate / fieldNegPct) * settings.control.fieldSafetyMargin
-  local correction = (targetField - info.fieldStrength) * settings.control.fieldCorrection
-  local wanted = base + correction
-
-  if info.temperature < 2500 and (isRunningLike(info.status) or isStoppingLike(info.status)) then
-    wanted = wanted * 1.15
-  end
-
-  return math.max(0, wanted)
-end
-
-local function calcWantedOutput(info, currentSetpoint)
-  local targetTemp = clamp(settings.targets.temp, 2500, 8000)
-  local targetSat = clamp(settings.targets.sat, 5, 95)
-  local maxOut = math.max(0, settings.targets.output)
-
-  local fieldTarget = clamp(settings.targets.field, 20, 80)
-  local minFieldThrottle = math.max(settings.limits.minFieldThrottle, fieldTarget - 12)
-
-  local score = 0
-  score = score + ((info.satPct - targetSat) * 1.8)
-  score = score + ((targetTemp - info.temperature) / 120)
-
-  if info.fieldPct < fieldTarget then
-    score = score - ((fieldTarget - info.fieldPct) * 4.0)
-  else
-    score = score + ((info.fieldPct - fieldTarget) * 0.4)
-  end
-
-  if info.fieldPct < minFieldThrottle then
-    score = score - ((minFieldThrottle - info.fieldPct) * 10)
-  end
-  if info.satPct < settings.limits.minSatThrottle then
-    score = score - ((settings.limits.minSatThrottle - info.satPct) * 12)
-  end
-  if info.temperature > settings.limits.maxTempThrottle then
-    score = score - ((info.temperature - settings.limits.maxTempThrottle) / 15)
-  end
-
-  local step = math.max(
-    settings.control.outputStepMin,
-    math.min(settings.control.outputStepMax, math.max(100000, currentSetpoint * settings.control.outputRampFraction))
+  local errorRF = targetField - info.fieldStrength
+  state.pid.inputIntegral = clamp(
+    state.pid.inputIntegral + errorRF,
+    settings.control.inIntegralMin,
+    settings.control.inIntegralMax
   )
 
-  local wanted = currentSetpoint + (score * step)
-  wanted = clamp(wanted, 0, maxOut)
+  local base = math.max(0, info.fieldDrainRate)
+  local controlTerm =
+    (settings.control.inKp * errorRF) +
+    (settings.control.inKi * state.pid.inputIntegral)
 
-  if info.fieldPct < minFieldThrottle or info.satPct < settings.limits.minSatThrottle or info.temperature > settings.limits.maxTempThrottle then
-    wanted = math.min(wanted, currentSetpoint * 0.70, info.generationRate * 1.05)
+  local target = base + controlTerm
+
+  if info.temperature < 2500 and (isRunningLike(info.status) or isStoppingLike(info.status) or isWarmingLike(info.status)) then
+    target = target * 1.08
   end
 
-  if info.temperature < 2200 then
-    wanted = math.min(wanted, info.generationRate * 0.25)
+  if info.fieldPct < settings.limits.minFieldThrottle then
+    target = math.max(target, base * 1.30)
   end
 
-  return math.max(0, wanted)
+  target = math.max(0, target)
+
+  return slew(
+    state.setpoints.input,
+    target,
+    settings.control.inSlewUp,
+    settings.control.inSlewDown
+  )
+end
+
+local function outputPI(info)
+  local tempTarget = clamp(settings.targets.temp, 2500, 8000)
+  local satTarget = clamp(settings.targets.sat, 5, 95)
+  local fieldTarget = clamp(settings.targets.field, 20, 80)
+  local outCap = math.max(0, settings.targets.output)
+
+  -- Composite error:
+  -- positive => can raise output
+  -- negative => should reduce output
+  local tempErr = (tempTarget - info.temperature) / 100
+  local satErr  = (info.satPct - satTarget) * 2.0
+  local fieldErr
+
+  if info.fieldPct >= fieldTarget then
+    fieldErr = (info.fieldPct - fieldTarget) * 0.5
+  else
+    fieldErr = -((fieldTarget - info.fieldPct) * 4.0)
+  end
+
+  local composite = tempErr + satErr + fieldErr
+
+  if info.temperature < settings.control.startupTemp then
+    composite = composite - 35
+  end
+
+  if info.fieldPct < settings.limits.minFieldThrottle then
+    composite = composite - ((settings.limits.minFieldThrottle - info.fieldPct) * 12)
+  end
+
+  if info.satPct < settings.limits.minSatThrottle then
+    composite = composite - ((settings.limits.minSatThrottle - info.satPct) * 14)
+  end
+
+  if info.temperature > settings.limits.maxTempThrottle then
+    composite = composite - ((info.temperature - settings.limits.maxTempThrottle) / 12)
+  end
+
+  state.pid.outputIntegral = clamp(
+    state.pid.outputIntegral + composite,
+    settings.control.outIntegralMin,
+    settings.control.outIntegralMax
+  )
+
+  local delta =
+    (settings.control.outKp * composite * math.max(250000, state.setpoints.output * 0.02 + 250000))
+    +
+    (settings.control.outKi * state.pid.outputIntegral * 10000)
+
+  local target = state.setpoints.output + delta
+  target = clamp(target, 0, outCap)
+
+  -- Startup limiter until reactor is really online
+  if info.temperature < settings.control.startupOutputHoldTemp then
+    target = math.min(target, info.generationRate * settings.control.startupOutputFraction)
+  end
+
+  -- Hard throttles
+  if info.fieldPct < settings.limits.minFieldThrottle
+    or info.satPct < settings.limits.minSatThrottle
+    or info.temperature > settings.limits.maxTempThrottle then
+    target = math.min(target, state.setpoints.output * 0.65, info.generationRate * 1.02)
+  end
+
+  if target < 0 then target = 0 end
+
+  return slew(
+    state.setpoints.output,
+    target,
+    settings.control.outSlewUp,
+    settings.control.outSlewDown
+  )
 end
 
 local function hardScram(info, why)
@@ -444,14 +566,28 @@ local function hardScram(info, why)
   state.message = "SCRAM: " .. why
   pcall(reactorStop)
 
-  local inFlow = calcWantedInput(info)
-  local outFlow = math.max(getGateFlowSetpoint(outputGate), info.generationRate)
+  -- During cool-down:
+  -- keep field fed
+  -- open output enough to let the reactor dump energy
+  local inFlow = math.max(info.fieldDrainRate or 0, state.setpoints.input, 100000)
+  local outFlow = math.max(state.setpoints.output, info.generationRate or 0)
 
-  pcall(setGateFlow, inputGate, inFlow)
-  pcall(setGateFlow, outputGate, outFlow)
+  applyInputSetpoint(inFlow)
+  applyOutputSetpoint(outFlow)
+end
+
+local function updateLiveReadings()
+  state.live.input = getGateLiveFlow(inputGate)
+  state.live.output = getGateLiveFlow(outputGate)
+
+  -- Keep setpoints synced with actual gate config on boot/peripheral refresh
+  state.setpoints.input = getGateSetpoint(inputGate, state.setpoints.input)
+  state.setpoints.output = getGateSetpoint(outputGate, state.setpoints.output)
 end
 
 local function controlTick()
+  updateLiveReadings()
+
   local raw = reactorInfo()
   local info = normalizeInfo(raw)
   state.info = info
@@ -461,90 +597,123 @@ local function controlTick()
     return
   end
 
-  if info.status == "beyond_hope" then
+  local status = info.status
+
+  -- Reset integrals when state class changes
+  if status ~= state.prev.status then
+    resetPID()
+    state.prev.status = status
+  end
+
+  -- Only allow hard safety SCRAM checks while active or shutting down.
+  -- Do NOT scram in offline/charge/warm-up states just because field/sat are low.
+  local runSafetyActive = isRunningLike(status) or isStoppingLike(status)
+
+  if status == "beyond_hope" then
     hardScram(info, "reactor beyond hope")
     return
   end
 
-  if info.fieldPct <= settings.limits.minFieldScram then
-    hardScram(info, "field too low")
-    return
-  end
+  if runSafetyActive then
+    if info.fieldPct <= settings.limits.minFieldScram then
+      hardScram(info, "field too low")
+      return
+    end
 
-  if info.satPct <= settings.limits.minSatScram then
-    hardScram(info, "saturation too low")
-    return
-  end
+    if info.satPct <= settings.limits.minSatScram then
+      hardScram(info, "saturation too low")
+      return
+    end
 
-  if info.temperature >= settings.limits.maxTempScram then
-    hardScram(info, "temperature too high")
-    return
+    if info.temperature >= settings.limits.maxTempScram then
+      hardScram(info, "temperature too high")
+      return
+    end
   end
-
-  local currentInSetpoint = getGateFlowSetpoint(inputGate)
-  local currentOutSetpoint = getGateFlowSetpoint(outputGate)
 
   if state.scrammed then
-    if isColdLike(info.status) then
-      pcall(setGateFlow, inputGate, 0)
-      pcall(setGateFlow, outputGate, 0)
+    if isColdLike(status) then
+      applyInputSetpoint(0)
+      applyOutputSetpoint(0)
       state.message = "SCRAM complete - reactor cold"
     else
-      local inFlow = calcWantedInput(info)
-      local outFlow = math.max(currentOutSetpoint, info.generationRate)
-      pcall(setGateFlow, inputGate, inFlow)
-      pcall(setGateFlow, outputGate, outFlow)
+      local inFlow = math.max(info.fieldDrainRate or 0, 100000)
+      local outFlow = math.max(state.setpoints.output, info.generationRate or 0)
+      applyInputSetpoint(inFlow)
+      applyOutputSetpoint(outFlow)
       state.message = "SCRAM cooling sequence active"
     end
     return
   end
 
-  if isColdLike(info.status) then
-    pcall(setGateFlow, inputGate, 0)
-    pcall(setGateFlow, outputGate, 0)
+  if isColdLike(status) then
+    applyInputSetpoint(0)
+    applyOutputSetpoint(0)
     state.message = "Reactor offline"
     return
   end
 
-  if isChargingLike(info.status) and not isRunningLike(info.status) then
-    local chargeReady = (info.fieldPct >= 50) and (info.satPct >= 50) and (info.temperature >= 2000)
+  if isChargingLike(status) then
+    local ready = (info.fieldPct >= 50) and (info.satPct >= 50) and (info.temperature >= 2000)
 
-    if chargeReady then
-      pcall(setGateFlow, inputGate, 0)
-      pcall(setGateFlow, outputGate, 0)
+    if ready then
+      applyInputSetpoint(0)
+      applyOutputSetpoint(0)
       state.message = "Charge complete - ready to activate"
     else
-      pcall(setGateFlow, outputGate, 0)
-      pcall(setGateFlow, inputGate, settings.control.chargeFlow)
-      state.message = "Charging reactor (need 50% field/sat and 2000C)"
+      applyOutputSetpoint(0)
+      applyInputSetpoint(settings.control.chargeFlow)
+      state.message = "Charging reactor (need 50% field / 50% sat / 2000C)"
     end
     return
   end
 
-  if isStoppingLike(info.status) then
-    local inFlow = calcWantedInput(info)
-    local outFlow = math.max(info.generationRate, currentOutSetpoint)
-    pcall(setGateFlow, inputGate, inFlow)
-    pcall(setGateFlow, outputGate, outFlow)
+  if isWarmingLike(status) then
+    -- Pre-running state; regulate gently but do not apply run SCRAM checks
+    local inTarget = inputPI(info)
+    local outTarget = math.min(
+      state.setpoints.output,
+      info.generationRate * settings.control.startupOutputFraction
+    )
+    applyInputSetpoint(inTarget)
+    applyOutputSetpoint(outTarget)
+    state.message = "Warming up"
+    return
+  end
+
+  if isStoppingLike(status) then
+    local inTarget = inputPI(info)
+    local outTarget = math.max(state.setpoints.output, info.generationRate)
+    applyInputSetpoint(inTarget)
+    applyOutputSetpoint(outTarget)
     state.message = "Controlled shutdown"
     return
   end
 
-  if isRunningLike(info.status) or info.status == "warming_up" then
-    local wantedIn = calcWantedInput(info)
-    local wantedOut = calcWantedOutput(info, currentOutSetpoint)
+  if isRunningLike(status) then
+    local inTarget = inputPI(info)
+    local outTarget = outputPI(info)
 
-    pcall(setGateFlow, inputGate, wantedIn)
-    pcall(setGateFlow, outputGate, wantedOut)
-    state.message = "Auto regulating"
+    applyInputSetpoint(inTarget)
+    applyOutputSetpoint(outTarget)
+
+    if info.temperature > settings.limits.maxTempWarn then
+      state.message = "Warning: high temp"
+    elseif info.fieldPct < settings.limits.minFieldWarn then
+      state.message = "Warning: low field"
+    elseif info.satPct < settings.limits.minSatWarn then
+      state.message = "Warning: low saturation"
+    else
+      state.message = "Auto regulating"
+    end
     return
   end
 
-  state.message = "Unhandled status: " .. tostring(info.status)
+  state.message = "Unhandled status: " .. tostring(status)
 end
 
 -------------------------
--- BUFFERED RENDERER   --
+-- BUFFERED RENDERER  --
 -------------------------
 local screen = {
   w = 0,
@@ -581,37 +750,51 @@ end
 local function writeAt(x, y, text, fg, bg)
   if y < 1 or y > screen.h then return end
   if x > screen.w then return end
+
   if x < 1 then
     text = text:sub(2 - x)
     x = 1
   end
+
   if #text <= 0 then return end
   if x + #text - 1 > screen.w then
     text = text:sub(1, screen.w - x + 1)
   end
 
   local row = screen.rows[y]
-  local beforeTxt = row.txt:sub(1, x - 1)
-  local afterTxt = row.txt:sub(x + #text)
-  row.txt = beforeTxt .. text .. afterTxt
+  row.txt = row.txt:sub(1, x - 1) .. text .. row.txt:sub(x + #text)
 
   local fgch = colors.toBlit(fg or colors.white)
   local bgch = colors.toBlit(bg or colors.black)
-  local fgStr = string.rep(fgch, #text)
-  local bgStr = string.rep(bgch, #text)
 
-  local beforeFg = row.fg:sub(1, x - 1)
-  local afterFg = row.fg:sub(x + #text)
-  row.fg = beforeFg .. fgStr .. afterFg
-
-  local beforeBg = row.bg:sub(1, x - 1)
-  local afterBg = row.bg:sub(x + #text)
-  row.bg = beforeBg .. bgStr .. afterBg
+  row.fg = row.fg:sub(1, x - 1) .. string.rep(fgch, #text) .. row.fg:sub(x + #text)
+  row.bg = row.bg:sub(1, x - 1) .. string.rep(bgch, #text) .. row.bg:sub(x + #text)
 end
 
-local function drawHBar(x, y, w, valuePct, fillBg, emptyBg, label)
+local function drawBox(x, y, w, h, title, borderColor, fillColor, textColor)
+  borderColor = borderColor or colors.gray
+  fillColor = fillColor or colors.black
+  textColor = textColor or colors.white
+
+  if w < 2 or h < 2 then return end
+
+  writeAt(x, y, "+" .. string.rep("-", w - 2) .. "+", borderColor, fillColor)
+  for yy = y + 1, y + h - 2 do
+    writeAt(x, yy, "|", borderColor, fillColor)
+    writeAt(x + 1, yy, string.rep(" ", w - 2), textColor, fillColor)
+    writeAt(x + w - 1, yy, "|", borderColor, fillColor)
+  end
+  writeAt(x, y + h - 1, "+" .. string.rep("-", w - 2) .. "+", borderColor, fillColor)
+
+  if title and #title > 0 and w > (#title + 4) then
+    writeAt(x + 2, y, " " .. title .. " ", textColor, fillColor)
+  end
+end
+
+local function drawBar(x, y, w, valuePct, fillBg, emptyBg, label)
   valuePct = clamp(valuePct, 0, 100)
   local filled = math.floor((w * valuePct) / 100)
+
   if filled > 0 then
     writeAt(x, y, string.rep(" ", filled), colors.white, fillBg)
   end
@@ -621,20 +804,20 @@ local function drawHBar(x, y, w, valuePct, fillBg, emptyBg, label)
 
   if label and #label > 0 and w >= #label + 2 then
     local lx = x + math.floor((w - #label) / 2)
-    writeAt(lx, y, label, colors.white, filled >= math.floor(w / 2) and fillBg or emptyBg)
+    local bg = (filled >= math.floor(w / 2)) and fillBg or emptyBg
+    writeAt(lx, y, label, colors.white, bg)
   end
 end
 
 local function addButton(x, y, w, h, label, bg, fg, onPress)
-  label = tostring(label)
   for yy = y, y + h - 1 do
     writeAt(x, yy, string.rep(" ", w), fg, bg)
   end
 
-  local ly = y + math.floor((h - 1) / 2)
-  local shown = label
+  local shown = tostring(label)
   if #shown > w - 2 then shown = shown:sub(1, w - 2) end
-  writeAt(x + math.max(0, math.floor((w - #shown) / 2)), ly, shown, fg, bg)
+  local ly = y + math.floor((h - 1) / 2)
+  writeAt(x + math.floor((w - #shown) / 2), ly, shown, fg, bg)
 
   state.buttons[#state.buttons + 1] = {
     x1 = x, y1 = y, x2 = x + w - 1, y2 = y + h - 1,
@@ -659,70 +842,93 @@ local function flushScreen()
 end
 
 -------------------------
--- UI                  --
+-- UI HELPERS         --
 -------------------------
-local function buttonColorForStatus(info)
+local function statusColor(info)
   if not info then return colors.gray end
-  if info.status == "beyond_hope" then return colors.red end
+  if state.scrammed then return colors.red end
   if isRunningLike(info.status) then return colors.lime end
   if isChargingLike(info.status) then return colors.orange end
-  if isStoppingLike(info.status) then return colors.yellow end
-  return colors.gray
+  if isWarmingLike(info.status) then return colors.yellow end
+  if isStoppingLike(info.status) then return colors.orange end
+  if isColdLike(info.status) then return colors.gray end
+  return colors.lightBlue
 end
 
 local function drawMainPage()
   clearFrame(colors.black)
-  local info = state.info
   local w, h = screen.w, screen.h
+  local info = state.info
 
   writeAt(1, 1, centerText(w, "DRACONIC REACTOR CONTROLLER"), colors.white, colors.blue)
 
-  local status = info and info.status or "unknown"
-  local statColor = buttonColorForStatus(info)
-  writeAt(2, 3, "Status:", colors.lightGray, colors.black)
-  writeAt(11, 3, status, colors.white, statColor)
+  local leftW = math.min(28, math.max(24, math.floor(w * 0.34)))
+  local rightX = leftW + 2
+  local rightW = w - rightX
+
+  drawBox(1, 3, leftW, 12, "STATUS", colors.lightGray, colors.black, colors.white)
+  drawBox(rightX, 3, rightW, 12, "REACTOR", colors.lightGray, colors.black, colors.white)
+  drawBox(1, h - 6, w, 4, "INFO", colors.lightGray, colors.black, colors.white)
 
   if info then
-    local inLive = getGateLiveFlow(inputGate)
-    local outLive = getGateLiveFlow(outputGate)
+    writeAt(3, 4, "Mode :", colors.lightGray, colors.black)
+    writeAt(10, 4, tostring(info.status), colors.white, statusColor(info))
 
-    writeAt(2, 5,  "Temp:", colors.lightGray, colors.black)
-    writeAt(11, 5, tostring(round(info.temperature)) .. " C", colors.white, colors.black)
+    writeAt(3, 5, "Temp :", colors.lightGray, colors.black)
+    writeAt(10, 5, tostring(round(info.temperature)) .. " C", colors.white, colors.black)
 
-    writeAt(2, 6,  "Field:", colors.lightGray, colors.black)
-    writeAt(11, 6, string.format("%.1f%%", info.fieldPct), colors.white, colors.black)
+    writeAt(3, 6, "Field:", colors.lightGray, colors.black)
+    writeAt(10, 6, string.format("%.1f%%", info.fieldPct), colors.white, colors.black)
 
-    writeAt(2, 7,  "Sat:", colors.lightGray, colors.black)
-    writeAt(11, 7, string.format("%.1f%%", info.satPct), colors.white, colors.black)
+    writeAt(3, 7, "Sat  :", colors.lightGray, colors.black)
+    writeAt(10, 7, string.format("%.1f%%", info.satPct), colors.white, colors.black)
 
-    writeAt(2, 8,  "Gen:", colors.lightGray, colors.black)
-    writeAt(11, 8, fmtRF(info.generationRate) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 8, "Fuel :", colors.lightGray, colors.black)
+    writeAt(10, 8, string.format("%.1f%%", info.fuelPct), colors.white, colors.black)
 
-    writeAt(2, 9,  "In:", colors.lightGray, colors.black)
-    writeAt(11, 9, fmtRF(inLive) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 9, "Gen  :", colors.lightGray, colors.black)
+    writeAt(10, 9, fmtRF(info.generationRate) .. "rf/t", colors.white, colors.black)
 
-    writeAt(2, 10, "Out:", colors.lightGray, colors.black)
-    writeAt(11,10, fmtRF(outLive) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 10, "In L :", colors.lightGray, colors.black)
+    writeAt(10,10, fmtRF(state.live.input) .. "rf/t", colors.white, colors.black)
 
-    local barW = math.max(10, w - 24)
-    drawHBar(22, 5, barW, clamp(info.temperature / math.max(settings.limits.maxTempScram, 1) * 100, 0, 100), colors.red, colors.gray, "TEMP")
-    drawHBar(22, 7, barW, info.fieldPct, colors.lime, colors.gray, "FIELD")
-    drawHBar(22, 9, barW, info.satPct, colors.cyan, colors.gray, "SAT")
-    drawHBar(22,11, barW, info.fuelPct, colors.orange, colors.gray, "FUEL")
+    writeAt(3, 11, "Out L:", colors.lightGray, colors.black)
+    writeAt(10,11, fmtRF(state.live.output) .. "rf/t", colors.white, colors.black)
+
+    writeAt(3, 12, "In S :", colors.lightGray, colors.black)
+    writeAt(10,12, fmtRF(state.setpoints.input) .. "rf/t", colors.cyan, colors.black)
+
+    writeAt(3, 13, "Out S:", colors.lightGray, colors.black)
+    writeAt(10,13, fmtRF(state.setpoints.output) .. "rf/t", colors.yellow, colors.black)
+
+    local bx = rightX + 2
+    local bw = rightW - 4
+
+    writeAt(bx, 4, "TEMP", colors.white, colors.black)
+    drawBar(bx, 5, bw, clamp((info.temperature / math.max(settings.limits.maxTempScram, 1)) * 100, 0, 100), colors.red, colors.gray, "")
+
+    writeAt(bx, 7, "FIELD", colors.white, colors.black)
+    drawBar(bx, 8, bw, info.fieldPct, colors.lime, colors.gray, "")
+
+    writeAt(bx, 10, "SATURATION", colors.white, colors.black)
+    drawBar(bx, 11, bw, info.satPct, colors.cyan, colors.gray, "")
+
+    writeAt(bx, 13, "FUEL", colors.white, colors.black)
+    drawBar(bx, 14, bw, info.fuelPct, colors.orange, colors.gray, "")
   else
-    writeAt(2, 5, "Waiting for reactor data...", colors.yellow, colors.black)
+    writeAt(3, 5, "Waiting for reactor data...", colors.yellow, colors.black)
   end
 
-  writeAt(2, h - 4, "Targets: T=" .. settings.targets.temp
-    .. "C F=" .. settings.targets.field
-    .. "% S=" .. settings.targets.sat
-    .. "% O=" .. fmtRF(settings.targets.output), colors.white, colors.black)
+  local targetsLine = "Targets  T:" .. settings.targets.temp .. "C  F:" .. settings.targets.field
+    .. "%  S:" .. settings.targets.sat .. "%  O:" .. fmtRF(settings.targets.output)
 
-  writeAt(2, h - 3, state.message:sub(1, math.max(1, w - 2)), colors.lightGray, colors.black)
+  writeAt(3, h - 5, targetsLine:sub(1, w - 4), colors.white, colors.black)
+  writeAt(3, h - 4, state.message:sub(1, w - 4), colors.lightGray, colors.black)
 
   local by = h - 1
-  local bw = math.max(8, math.floor((w - 5) / 4))
+  local bw = math.max(10, math.floor((w - 7) / 4))
   local gap = 1
+
   local x1 = 1
   local x2 = x1 + bw + gap
   local x3 = x2 + bw + gap
@@ -730,13 +936,15 @@ local function drawMainPage()
 
   addButton(x1, by - 1, bw, 2, "CHARGE", colors.orange, colors.black, function()
     state.scrammed = false
-    pcall(reactorCharge)
+    resetPID()
+    reactorCharge()
     state.message = "Charge command sent"
   end)
 
   addButton(x2, by - 1, bw, 2, "ACTIVATE", colors.lime, colors.black, function()
     state.scrammed = false
-    pcall(reactorActivate)
+    resetPID()
+    reactorActivate()
     state.message = "Activate command sent"
   end)
 
@@ -745,7 +953,7 @@ local function drawMainPage()
       hardScram(state.info, "manual scram")
     else
       state.scrammed = true
-      pcall(reactorStop)
+      reactorStop()
       state.message = "Manual SCRAM"
     end
   end)
@@ -763,8 +971,8 @@ end
 
 local function drawTuneRow(y, label, value, buttons, valueColor)
   local w = screen.w
-  writeAt(2, y, label, colors.lightGray, colors.black)
-  writeAt(math.floor(w / 2) - 6, y, tostring(value), valueColor or colors.white, colors.black)
+  writeAt(3, y, label, colors.lightGray, colors.black)
+  writeAt(math.floor(w * 0.45), y, tostring(value), valueColor or colors.white, colors.black)
 
   local x = w - 1
   for i = #buttons, 1, -1 do
@@ -781,25 +989,28 @@ local function drawTunePage()
   local w, h = screen.w, screen.h
 
   writeAt(1, 1, centerText(w, "TUNING"), colors.white, colors.blue)
-  writeAt(2, 3, "Adjust reactor targets.", colors.white, colors.black)
-  writeAt(2, 4, "Output target supports large jumps up to 10B rf/t.", colors.lightGray, colors.black)
 
-  drawTuneRow(6, "Temp Target (C)", settings.targets.temp, {
+  drawBox(1, 3, w, h - 6, "TARGETS", colors.lightGray, colors.black, colors.white)
+
+  writeAt(3, 4, "Adjust operating targets and output cap.", colors.white, colors.black)
+  writeAt(3, 5, "Safer high-output baseline: Temp 7800 / Field 50 / Sat 30", colors.lightGray, colors.black)
+
+  drawTuneRow(7, "Temp Target (C)", settings.targets.temp, {
     { label = "-50", fn = function() adjustSetting("targets", "temp", -50, 2500, 8000) end },
     { label = "+50", fn = function() adjustSetting("targets", "temp",  50, 2500, 8000) end },
   }, colors.orange)
 
-  drawTuneRow(8, "Field Target (%)", settings.targets.field, {
+  drawTuneRow(9, "Field Target (%)", settings.targets.field, {
     { label = "-1", fn = function() adjustSetting("targets", "field", -1, 20, 80) end },
     { label = "+1", fn = function() adjustSetting("targets", "field",  1, 20, 80) end },
   }, colors.lime)
 
-  drawTuneRow(10, "Sat Target (%)", settings.targets.sat, {
+  drawTuneRow(11, "Sat Target (%)", settings.targets.sat, {
     { label = "-1", fn = function() adjustSetting("targets", "sat", -1, 5, 95) end },
     { label = "+1", fn = function() adjustSetting("targets", "sat",  1, 5, 95) end },
   }, colors.cyan)
 
-  drawTuneRow(12, "Output Cap (rf/t)", fmtRF(settings.targets.output), {
+  drawTuneRow(13, "Output Cap (rf/t)", fmtRF(settings.targets.output), {
     { label = "-50k",  fn = function() adjustSetting("targets", "output", -50000, 0, 10000000000) end, bg = colors.gray },
     { label = "+50k",  fn = function() adjustSetting("targets", "output",  50000, 0, 10000000000) end, bg = colors.gray },
     { label = "-5M",   fn = function() adjustSetting("targets", "output", -5000000, 0, 10000000000) end, bg = colors.lightGray, fg = colors.black },
@@ -808,8 +1019,12 @@ local function drawTunePage()
     { label = "+100M", fn = function() adjustSetting("targets", "output",  100000000, 0, 10000000000) end, bg = colors.yellow, fg = colors.black },
   }, colors.yellow)
 
-  writeAt(2, h - 5, "Suggested baseline:", colors.white, colors.black)
-  writeAt(2, h - 4, "Temp 7800 / Field 45 / Sat 25, then raise output cap gradually.", colors.lightGray, colors.black)
+  drawTuneRow(15, "Charge Flow (rf/t)", fmtRF(settings.control.chargeFlow), {
+    { label = "-1M", fn = function() adjustSetting("control", "chargeFlow", -1000000, 100000, 5000000000) end, bg = colors.gray },
+    { label = "+1M", fn = function() adjustSetting("control", "chargeFlow",  1000000, 100000, 5000000000) end, bg = colors.gray },
+    { label = "-10M", fn = function() adjustSetting("control", "chargeFlow", -10000000, 100000, 5000000000) end, bg = colors.lightGray, fg = colors.black },
+    { label = "+10M", fn = function() adjustSetting("control", "chargeFlow",  10000000, 100000, 5000000000) end, bg = colors.lightGray, fg = colors.black },
+  }, colors.orange)
 
   addButton(2, h - 2, 10, 2, "HOME", colors.blue, colors.white, function()
     state.page = "main"
@@ -823,6 +1038,7 @@ local function drawTunePage()
 
   addButton(26, h - 2, 12, 2, "UNSCRAM", colors.orange, colors.black, function()
     state.scrammed = false
+    resetPID()
     state.message = "SCRAM latch cleared"
   end)
 end
@@ -837,7 +1053,7 @@ local function render()
 end
 
 -------------------------
--- TOUCH HANDLING      --
+-- EVENTS             --
 -------------------------
 local function handleTouch(x, y)
   for i = 1, #state.buttons do
@@ -852,9 +1068,6 @@ local function handleTouch(x, y)
   end
 end
 
--------------------------
--- LOOPS               --
--------------------------
 local function controlLoop()
   while state.running do
     local ok, err = pcall(controlTick)
@@ -880,7 +1093,7 @@ local function eventLoop()
     local ev, p1, p2, p3 = os.pullEvent()
     if ev == "monitor_touch" then
       handleTouch(p2, p3)
-    elseif ev == "peripheral_detach" or ev == "peripheral" then
+    elseif ev == "peripheral" or ev == "peripheral_detach" then
       local ok, err = pcall(function()
         initPeripherals()
         initScreen()
@@ -893,12 +1106,18 @@ local function eventLoop()
 end
 
 -------------------------
--- BOOT                --
+-- BOOT               --
 -------------------------
 local function main()
   loadSettings()
   initPeripherals()
   initScreen()
+
+  -- Sync startup gate state
+  state.setpoints.input = getGateSetpoint(inputGate, 0)
+  state.setpoints.output = getGateSetpoint(outputGate, 0)
+  updateLiveReadings()
+
   state.message = "Ready"
   parallel.waitForAny(controlLoop, renderLoop, eventLoop)
 end
@@ -914,7 +1133,7 @@ if not ok then
       monitor.setCursorPos(1,1)
       monitor.write("Fatal error:")
       monitor.setCursorPos(1,2)
-      monitor.write(tostring(err):sub(1, 60))
+      monitor.write(tostring(err):sub(1, 80))
     end)
   end
 end
