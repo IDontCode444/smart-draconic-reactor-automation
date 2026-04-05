@@ -1,20 +1,10 @@
 -- Draconic Reactor Controller for CC:Tweaked
--- Safe-start simplified version
+-- Simplified + fixed CHARGE state handling
 --
 -- Named peripherals:
 --   reactor:     draconic_reactor_0
 --   input gate:  flow_gate_0
 --   output gate: flow_gate_1
---
--- Features:
--- - Auto-detect monitor
--- - Manual buttons: CHARGE / ACTIVATE / SCRAM / TUNING
--- - One tuning page only
--- - Adjustable targets:
---     temp, field, saturation, output
--- - Safer startup:
---     output stays at 0 until reactor is clearly stable
--- - Buffered monitor drawing to reduce flicker
 
 -------------------------
 -- USER EDITABLE NAMES --
@@ -59,14 +49,12 @@ local defaults = {
 
     chargeFlow       = 8000000,
 
-    -- startup behavior
     startupHoldTemp         = 2500,
     startupReleaseFieldPct  = 45,
     startupReleaseSatPct    = 85,
     startupMinStableSeconds = 3.0,
-    startupOutputCap        = 1000000, -- first output allowed during startup release
+    startupOutputCap        = 1000000,
 
-    -- input PI
     inKp = 0.20,
     inKi = 0.008,
     inIntegralMin = -50000000,
@@ -74,7 +62,6 @@ local defaults = {
     inSlewUp      = 2500000,
     inSlewDown    = 3500000,
 
-    -- output PI
     outKp = 0.050,
     outKi = 0.002,
     outIntegralMin = -1000000000,
@@ -99,6 +86,8 @@ local state = {
   message = "Booting...",
   lastSave = 0,
 
+  mode = "idle", -- idle / charging / starting / running / scram
+
   setpoints = {
     input = 0,
     output = 0,
@@ -117,7 +106,6 @@ local state = {
   prevStatus = "unknown",
 
   startup = {
-    armed = false,
     stableSince = nil,
   }
 }
@@ -205,7 +193,6 @@ local function resetPID()
 end
 
 local function resetStartup()
-  state.startup.armed = false
   state.startup.stableSince = nil
 end
 
@@ -552,6 +539,7 @@ end
 
 local function hardScram(info, why)
   state.scrammed = true
+  state.mode = "scram"
   state.message = "SCRAM: " .. why
   pcall(reactorStop)
 
@@ -576,13 +564,10 @@ local function controlTick()
 
   if info.status ~= state.prevStatus then
     resetPID()
-    if not (isRunningLike(info.status) or isWarmingLike(info.status)) then
-      resetStartup()
-    end
     state.prevStatus = info.status
   end
 
-  local runSafetyActive = isRunningLike(info.status) or isStoppingLike(info.status) or isWarmingLike(info.status)
+  local runSafetyActive = (state.mode == "starting") or (state.mode == "running") or isStoppingLike(info.status)
 
   if info.status == "beyond_hope" then
     hardScram(info, "reactor beyond hope")
@@ -604,7 +589,7 @@ local function controlTick()
     end
   end
 
-  if state.scrammed then
+  if state.scrammed or state.mode == "scram" then
     if isColdLike(info.status) then
       applyInputSetpoint(0)
       applyOutputSetpoint(0)
@@ -619,36 +604,32 @@ local function controlTick()
     return
   end
 
-  if isColdLike(info.status) then
-    applyInputSetpoint(0)
-    applyOutputSetpoint(0)
-    state.message = "Reactor offline"
-    return
-  end
-
-  if isChargingLike(info.status) then
+  -- Explicit charging mode
+  if state.mode == "charging" then
     local ready = (info.fieldPct >= 50) and (info.satPct >= 50) and (info.temperature >= 2000)
 
-    if ready then
-      applyInputSetpoint(0)
+    if ready or isChargingLike(info.status) then
       applyOutputSetpoint(0)
-      state.message = "Charge complete - ready to activate"
+      if ready then
+        applyInputSetpoint(0)
+        state.message = "Charge complete - ready to activate"
+      else
+        applyInputSetpoint(settings.control.chargeFlow)
+        state.message = "Charging reactor"
+      end
     else
+      -- stay charging even if status still says cold
       applyOutputSetpoint(0)
       applyInputSetpoint(settings.control.chargeFlow)
-      state.message = "Charging reactor (need 50% field / 50% sat / 2000C)"
+      state.message = "Charging reactor"
     end
     return
   end
 
-  if isWarmingLike(info.status) or isRunningLike(info.status) then
+  -- Explicit startup mode after activate
+  if state.mode == "starting" then
     local inTarget = inputPI(info)
     applyInputSetpoint(inTarget)
-
-    if not state.startup.armed then
-      state.startup.armed = true
-      state.startup.stableSince = nil
-    end
 
     if startupStable(info) then
       if not state.startup.stableSince then
@@ -662,18 +643,37 @@ local function controlTick()
       and (os.clock() - state.startup.stableSince) >= settings.control.startupMinStableSeconds
 
     if not startupReleased then
-      local safeStartupOut = math.min(settings.control.startupOutputCap, settings.targets.output)
       if info.temperature < settings.control.startupHoldTemp then
         applyOutputSetpoint(0)
         state.message = "Startup hold: warming reactor"
       else
-        applyOutputSetpoint(safeStartupOut)
+        applyOutputSetpoint(math.min(settings.control.startupOutputCap, settings.targets.output))
         state.message = "Startup hold: gentle output ramp"
       end
       return
     end
 
+    state.mode = "running"
+    state.message = "Startup complete"
+    return
+  end
+
+  if isStoppingLike(info.status) then
+    local inTarget = inputPI(info)
+    local outTarget = math.max(state.setpoints.output, info.generationRate or 0)
+    applyInputSetpoint(inTarget)
+    applyOutputSetpoint(outTarget)
+    state.message = "Controlled shutdown"
+    return
+  end
+
+  if state.mode == "running" or isRunningLike(info.status) then
+    state.mode = "running"
+
+    local inTarget = inputPI(info)
     local outTarget = outputPI(info)
+
+    applyInputSetpoint(inTarget)
     applyOutputSetpoint(outTarget)
 
     if info.temperature > settings.limits.maxTempWarn then
@@ -688,16 +688,16 @@ local function controlTick()
     return
   end
 
-  if isStoppingLike(info.status) then
-    local inTarget = inputPI(info)
-    local outTarget = math.max(state.setpoints.output, info.generationRate or 0)
-    applyInputSetpoint(inTarget)
-    applyOutputSetpoint(outTarget)
-    state.message = "Controlled shutdown"
+  -- Idle behavior
+  if isColdLike(info.status) then
+    applyInputSetpoint(0)
+    applyOutputSetpoint(0)
+    state.mode = "idle"
+    state.message = "Reactor offline"
     return
   end
 
-  state.message = "Unhandled status: " .. tostring(info.status)
+  state.message = "Waiting / idle"
 end
 
 -------------------------
@@ -826,9 +826,9 @@ end
 local function statusColor(info)
   if not info then return colors.gray end
   if state.scrammed then return colors.red end
-  if isRunningLike(info.status) then return colors.lime end
-  if isChargingLike(info.status) then return colors.orange end
-  if isWarmingLike(info.status) then return colors.yellow end
+  if state.mode == "charging" then return colors.orange end
+  if state.mode == "starting" then return colors.yellow end
+  if state.mode == "running" then return colors.lime end
   if isStoppingLike(info.status) then return colors.orange end
   if isColdLike(info.status) then return colors.gray end
   return colors.lightBlue
@@ -841,44 +841,47 @@ local function drawMainPage()
 
   writeAt(1, 1, centerText(w, "DRACONIC REACTOR CONTROLLER"), colors.white, colors.blue)
 
-  local leftW = math.min(29, math.max(26, math.floor(w * 0.35)))
+  local leftW = math.min(31, math.max(27, math.floor(w * 0.36)))
   local rightX = leftW + 2
   local rightW = w - rightX
 
-  drawBox(1, 3, leftW, 12, "STATUS", colors.lightGray, colors.black, colors.white)
-  drawBox(rightX, 3, rightW, 12, "REACTOR", colors.lightGray, colors.black, colors.white)
+  drawBox(1, 3, leftW, 13, "STATUS", colors.lightGray, colors.black, colors.white)
+  drawBox(rightX, 3, rightW, 13, "REACTOR", colors.lightGray, colors.black, colors.white)
   drawBox(1, h - 6, w, 4, "INFO", colors.lightGray, colors.black, colors.white)
 
   if info then
-    writeAt(3, 4,  "Mode :", colors.lightGray, colors.black)
-    writeAt(10, 4, tostring(info.status), colors.white, statusColor(info))
+    writeAt(3, 4,  "Ctrl :", colors.lightGray, colors.black)
+    writeAt(10, 4, tostring(state.mode), colors.white, statusColor(info))
 
-    writeAt(3, 5,  "Temp :", colors.lightGray, colors.black)
-    writeAt(10, 5, tostring(round(info.temperature)) .. " C", colors.white, colors.black)
+    writeAt(3, 5,  "Mode :", colors.lightGray, colors.black)
+    writeAt(10, 5, tostring(info.status), colors.white, statusColor(info))
 
-    writeAt(3, 6,  "Field:", colors.lightGray, colors.black)
-    writeAt(10, 6, string.format("%.1f%%", info.fieldPct), colors.white, colors.black)
+    writeAt(3, 6,  "Temp :", colors.lightGray, colors.black)
+    writeAt(10, 6, tostring(round(info.temperature)) .. " C", colors.white, colors.black)
 
-    writeAt(3, 7,  "Sat  :", colors.lightGray, colors.black)
-    writeAt(10, 7, string.format("%.1f%%", info.satPct), colors.white, colors.black)
+    writeAt(3, 7,  "Field:", colors.lightGray, colors.black)
+    writeAt(10, 7, string.format("%.1f%%", info.fieldPct), colors.white, colors.black)
 
-    writeAt(3, 8,  "Fuel :", colors.lightGray, colors.black)
-    writeAt(10, 8, string.format("%.1f%%", info.fuelPct), colors.white, colors.black)
+    writeAt(3, 8,  "Sat  :", colors.lightGray, colors.black)
+    writeAt(10, 8, string.format("%.1f%%", info.satPct), colors.white, colors.black)
 
-    writeAt(3, 9,  "Gen  :", colors.lightGray, colors.black)
-    writeAt(10, 9, fmtRF(info.generationRate) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 9,  "Fuel :", colors.lightGray, colors.black)
+    writeAt(10, 9, string.format("%.1f%%", info.fuelPct), colors.white, colors.black)
 
-    writeAt(3, 10, "In L :", colors.lightGray, colors.black)
-    writeAt(10,10, fmtRF(state.live.input) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 10, "Gen  :", colors.lightGray, colors.black)
+    writeAt(10,10, fmtRF(info.generationRate) .. "rf/t", colors.white, colors.black)
 
-    writeAt(3, 11, "Out L:", colors.lightGray, colors.black)
-    writeAt(10,11, fmtRF(state.live.output) .. "rf/t", colors.white, colors.black)
+    writeAt(3, 11, "In L :", colors.lightGray, colors.black)
+    writeAt(10,11, fmtRF(state.live.input) .. "rf/t", colors.white, colors.black)
 
-    writeAt(3, 12, "In S :", colors.lightGray, colors.black)
-    writeAt(10,12, fmtRF(state.setpoints.input) .. "rf/t", colors.cyan, colors.black)
+    writeAt(3, 12, "Out L:", colors.lightGray, colors.black)
+    writeAt(10,12, fmtRF(state.live.output) .. "rf/t", colors.white, colors.black)
 
-    writeAt(3, 13, "Out S:", colors.lightGray, colors.black)
-    writeAt(10,13, fmtRF(state.setpoints.output) .. "rf/t", colors.yellow, colors.black)
+    writeAt(3, 13, "In S :", colors.lightGray, colors.black)
+    writeAt(10,13, fmtRF(state.setpoints.input) .. "rf/t", colors.cyan, colors.black)
+
+    writeAt(3, 14, "Out S:", colors.lightGray, colors.black)
+    writeAt(10,14, fmtRF(state.setpoints.output) .. "rf/t", colors.yellow, colors.black)
 
     local bx = rightX + 2
     local bw = rightW - 4
@@ -913,17 +916,19 @@ local function drawMainPage()
 
   addButton(x1, by - 1, bw, 2, "CHARGE", colors.orange, colors.black, function()
     state.scrammed = false
+    state.mode = "charging"
     resetPID()
     resetStartup()
+    applyOutputSetpoint(0)
     reactorCharge()
     state.message = "Charge command sent"
   end)
 
   addButton(x2, by - 1, bw, 2, "ACTIVATE", colors.lime, colors.black, function()
     state.scrammed = false
+    state.mode = "starting"
     resetPID()
-    state.startup.armed = true
-    state.startup.stableSince = nil
+    resetStartup()
     applyOutputSetpoint(0)
     reactorActivate()
     state.message = "Activate command sent"
@@ -934,6 +939,7 @@ local function drawMainPage()
       hardScram(state.info, "manual scram")
     else
       state.scrammed = true
+      state.mode = "scram"
       reactorStop()
       state.message = "Manual SCRAM"
     end
@@ -968,7 +974,7 @@ local function drawTunePage()
   drawBox(1, 3, w, h - 6, "TARGETS", colors.lightGray, colors.black, colors.white)
 
   writeAt(3, 4, "Adjust reactor targets only.", colors.white, colors.black)
-  writeAt(3, 5, "Suggested safe starting point: Temp 7800 / Field 60 / Sat 50 / Output 20M", colors.lightGray, colors.black)
+  writeAt(3, 5, "Suggested safe start: Temp 7800 / Field 60 / Sat 50 / Output 20M", colors.lightGray, colors.black)
 
   writeAt(3, 7,  "Temp Target:", colors.lightGray, colors.black)
   writeAt(18, 7, tostring(settings.targets.temp), colors.orange, colors.black)
@@ -1022,6 +1028,7 @@ local function drawTunePage()
 
   addButton(26, h - 2, 12, 2, "UNSCRAM", colors.orange, colors.black, function()
     state.scrammed = false
+    state.mode = "idle"
     resetPID()
     resetStartup()
     state.message = "SCRAM latch cleared"
