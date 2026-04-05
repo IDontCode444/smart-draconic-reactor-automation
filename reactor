@@ -1,10 +1,20 @@
 -- Draconic Reactor Controller for CC:Tweaked
--- ATM10 / Draconic Evolution
+-- Safe-start simplified version
 --
 -- Named peripherals:
 --   reactor:     draconic_reactor_0
 --   input gate:  flow_gate_0
 --   output gate: flow_gate_1
+--
+-- Features:
+-- - Auto-detect monitor
+-- - Manual buttons: CHARGE / ACTIVATE / SCRAM / TUNING
+-- - One tuning page only
+-- - Adjustable targets:
+--     temp, field, saturation, output
+-- - Safer startup:
+--     output stays at 0 until reactor is clearly stable
+-- - Buffered monitor drawing to reduce flicker
 
 -------------------------
 -- USER EDITABLE NAMES --
@@ -23,17 +33,17 @@ local defaults = {
 
   targets = {
     temp   = 7800,
-    field  = 55,
-    sat    = 35,
+    field  = 60,
+    sat    = 50,
     output = 20000000,
   },
 
   limits = {
-    minFieldWarn     = 18,
-    minFieldThrottle = 22,
+    minFieldWarn     = 20,
+    minFieldThrottle = 25,
     minFieldScram    = 10,
 
-    minSatWarn       = 10,
+    minSatWarn       = 12,
     minSatThrottle   = 8,
     minSatScram      = 3,
 
@@ -49,30 +59,28 @@ local defaults = {
 
     chargeFlow       = 8000000,
 
-    -- Input PI
-    inKp = 0.22,
-    inKi = 0.010,
+    -- startup behavior
+    startupHoldTemp         = 2500,
+    startupReleaseFieldPct  = 45,
+    startupReleaseSatPct    = 85,
+    startupMinStableSeconds = 3.0,
+    startupOutputCap        = 1000000, -- first output allowed during startup release
+
+    -- input PI
+    inKp = 0.20,
+    inKi = 0.008,
     inIntegralMin = -50000000,
     inIntegralMax =  50000000,
     inSlewUp      = 2500000,
     inSlewDown    = 3500000,
 
-    -- Output PI
-    outKp = 0.075,
-    outKi = 0.004,
+    -- output PI
+    outKp = 0.050,
+    outKi = 0.002,
     outIntegralMin = -1000000000,
     outIntegralMax =  1000000000,
-    outSlewUp      = 5000000,
+    outSlewUp      = 2000000,
     outSlewDown    = 12000000,
-
-    startupTemp = 2500,
-    startupOutputFraction = 0.20,
-
-    -- Bootstrap logic
-    bootstrapMinOutput = 500000,
-    bootstrapMaxOutput = 25000000,
-    bootstrapCapFrac   = 0.06,
-    bootstrapDelay     = 3.0,
   }
 }
 
@@ -84,7 +92,6 @@ local settings
 
 local state = {
   page = "main",
-  tunePage = 1,
   buttons = {},
   info = nil,
   running = true,
@@ -108,7 +115,11 @@ local state = {
   },
 
   prevStatus = "unknown",
-  runningZeroOutputSince = nil,
+
+  startup = {
+    armed = false,
+    stableSince = nil,
+  }
 }
 
 -------------------------
@@ -173,16 +184,6 @@ local function fmtRF(n)
   end
 end
 
-local function fmtNum(n)
-  if math.abs(n) >= 1000 then
-    return string.format("%.0f", n)
-  elseif math.abs(n) >= 10 then
-    return string.format("%.1f", n)
-  else
-    return string.format("%.3f", n)
-  end
-end
-
 local function centerText(width, txt)
   if #txt >= width then return txt:sub(1, width) end
   local left = math.floor((width - #txt) / 2)
@@ -201,6 +202,11 @@ end
 local function resetPID()
   state.pid.inputIntegral = 0
   state.pid.outputIntegral = 0
+end
+
+local function resetStartup()
+  state.startup.armed = false
+  state.startup.stableSince = nil
 end
 
 -------------------------
@@ -450,25 +456,6 @@ local function updateLiveReadings()
   state.live.output = getGateLiveFlow(outputGate)
 end
 
-local function bootstrapOutputValue()
-  local cap = math.max(0, settings.targets.output)
-  local base = math.max(
-    settings.control.bootstrapMinOutput,
-    math.min(settings.control.bootstrapMaxOutput, cap * settings.control.bootstrapCapFrac)
-  )
-  return round(base)
-end
-
-local function forceBootstrapOutput()
-  local kick = bootstrapOutputValue()
-  if state.setpoints.output < kick then
-    applyOutputSetpoint(kick)
-    state.message = "Bootstrap output kick applied"
-  else
-    state.message = "Output already above bootstrap"
-  end
-end
-
 local function inputPI(info)
   local targetFieldPct = clamp(settings.targets.field, 20, 80)
   local targetField = info.maxFieldStrength * (targetFieldPct / 100)
@@ -487,12 +474,8 @@ local function inputPI(info)
 
   local target = base + control
 
-  if info.temperature < 2500 and (isRunningLike(info.status) or isStoppingLike(info.status) or isWarmingLike(info.status)) then
-    target = target * 1.08
-  end
-
   if info.fieldPct < settings.limits.minFieldThrottle then
-    target = math.max(target, base * 1.30)
+    target = math.max(target, base * 1.4)
   end
 
   target = math.max(0, target)
@@ -516,25 +499,19 @@ local function outputPI(info)
 
   local fieldErr
   if info.fieldPct >= fieldTarget then
-    fieldErr = (info.fieldPct - fieldTarget) * 0.5
+    fieldErr = (info.fieldPct - fieldTarget) * 0.35
   else
-    fieldErr = -((fieldTarget - info.fieldPct) * 4.0)
+    fieldErr = -((fieldTarget - info.fieldPct) * 4.5)
   end
 
   local composite = tempErr + satErr + fieldErr
 
-  if info.temperature < settings.control.startupTemp then
-    composite = composite - 35
-  end
-
   if info.fieldPct < settings.limits.minFieldThrottle then
     composite = composite - ((settings.limits.minFieldThrottle - info.fieldPct) * 12)
   end
-
   if info.satPct < settings.limits.minSatThrottle then
     composite = composite - ((settings.limits.minSatThrottle - info.satPct) * 14)
   end
-
   if info.temperature > settings.limits.maxTempThrottle then
     composite = composite - ((info.temperature - settings.limits.maxTempThrottle) / 12)
   end
@@ -546,7 +523,6 @@ local function outputPI(info)
   )
 
   local scale = math.max(250000, state.setpoints.output * 0.02 + 250000)
-
   local delta =
     (settings.control.outKp * composite * scale) +
     (settings.control.outKi * state.pid.outputIntegral * 10000)
@@ -554,18 +530,10 @@ local function outputPI(info)
   local target = state.setpoints.output + delta
   target = clamp(target, 0, outCap)
 
-  if info.temperature < settings.control.startupTemp then
-    target = math.min(target, math.max(bootstrapOutputValue(), outCap * settings.control.startupOutputFraction))
-  end
-
   if info.fieldPct < settings.limits.minFieldThrottle
     or info.satPct < settings.limits.minSatThrottle
     or info.temperature > settings.limits.maxTempThrottle then
-    target = math.min(target, math.max(0, state.setpoints.output * 0.65))
-  end
-
-  if isRunningLike(info.status) and info.satPct > 95 and state.live.output < 1000 and state.setpoints.output < bootstrapOutputValue() then
-    target = math.max(target, bootstrapOutputValue())
+    target = math.min(target, math.max(0, state.setpoints.output * 0.60))
   end
 
   return slew(
@@ -576,26 +544,22 @@ local function outputPI(info)
   )
 end
 
+local function startupStable(info)
+  return info.temperature >= settings.control.startupHoldTemp
+    and info.fieldPct >= settings.control.startupReleaseFieldPct
+    and info.satPct >= settings.control.startupReleaseSatPct
+end
+
 local function hardScram(info, why)
   state.scrammed = true
   state.message = "SCRAM: " .. why
   pcall(reactorStop)
 
   local inFlow = math.max(info.fieldDrainRate or 0, state.setpoints.input, 100000)
-  local outFlow = math.max(state.setpoints.output, info.generationRate or 0, bootstrapOutputValue())
+  local outFlow = math.max(state.setpoints.output, info.generationRate or 0)
 
   applyInputSetpoint(inFlow)
   applyOutputSetpoint(outFlow)
-end
-
-local function updateRunningDeadlockTimer(info)
-  if isRunningLike(info.status) and info.satPct > 95 and state.live.output < 1000 and state.setpoints.output < 1000 then
-    if not state.runningZeroOutputSince then
-      state.runningZeroOutputSince = os.clock()
-    end
-  else
-    state.runningZeroOutputSince = nil
-  end
 end
 
 local function controlTick()
@@ -612,12 +576,13 @@ local function controlTick()
 
   if info.status ~= state.prevStatus then
     resetPID()
+    if not (isRunningLike(info.status) or isWarmingLike(info.status)) then
+      resetStartup()
+    end
     state.prevStatus = info.status
   end
 
-  updateRunningDeadlockTimer(info)
-
-  local runSafetyActive = isRunningLike(info.status) or isStoppingLike(info.status)
+  local runSafetyActive = isRunningLike(info.status) or isStoppingLike(info.status) or isWarmingLike(info.status)
 
   if info.status == "beyond_hope" then
     hardScram(info, "reactor beyond hope")
@@ -646,7 +611,7 @@ local function controlTick()
       state.message = "SCRAM complete - reactor cold"
     else
       local inFlow = math.max(info.fieldDrainRate or 0, 100000)
-      local outFlow = math.max(state.setpoints.output, info.generationRate or 0, bootstrapOutputValue())
+      local outFlow = math.max(state.setpoints.output, info.generationRate or 0)
       applyInputSetpoint(inFlow)
       applyOutputSetpoint(outFlow)
       state.message = "SCRAM cooling sequence active"
@@ -676,34 +641,39 @@ local function controlTick()
     return
   end
 
-  if isWarmingLike(info.status) then
+  if isWarmingLike(info.status) or isRunningLike(info.status) then
     local inTarget = inputPI(info)
-    local outTarget = math.max(bootstrapOutputValue(), state.setpoints.output)
     applyInputSetpoint(inTarget)
-    applyOutputSetpoint(outTarget)
-    state.message = "Warming up"
-    return
-  end
 
-  if isStoppingLike(info.status) then
-    local inTarget = inputPI(info)
-    local outTarget = math.max(state.setpoints.output, info.generationRate or 0, bootstrapOutputValue())
-    applyInputSetpoint(inTarget)
-    applyOutputSetpoint(outTarget)
-    state.message = "Controlled shutdown"
-    return
-  end
-
-  if isRunningLike(info.status) then
-    if state.runningZeroOutputSince and (os.clock() - state.runningZeroOutputSince) >= settings.control.bootstrapDelay then
-      forceBootstrapOutput()
-      state.runningZeroOutputSince = nil
+    if not state.startup.armed then
+      state.startup.armed = true
+      state.startup.stableSince = nil
     end
 
-    local inTarget = inputPI(info)
-    local outTarget = outputPI(info)
+    if startupStable(info) then
+      if not state.startup.stableSince then
+        state.startup.stableSince = os.clock()
+      end
+    else
+      state.startup.stableSince = nil
+    end
 
-    applyInputSetpoint(inTarget)
+    local startupReleased = state.startup.stableSince
+      and (os.clock() - state.startup.stableSince) >= settings.control.startupMinStableSeconds
+
+    if not startupReleased then
+      local safeStartupOut = math.min(settings.control.startupOutputCap, settings.targets.output)
+      if info.temperature < settings.control.startupHoldTemp then
+        applyOutputSetpoint(0)
+        state.message = "Startup hold: warming reactor"
+      else
+        applyOutputSetpoint(safeStartupOut)
+        state.message = "Startup hold: gentle output ramp"
+      end
+      return
+    end
+
+    local outTarget = outputPI(info)
     applyOutputSetpoint(outTarget)
 
     if info.temperature > settings.limits.maxTempWarn then
@@ -712,11 +682,18 @@ local function controlTick()
       state.message = "Warning: low field"
     elseif info.satPct < settings.limits.minSatWarn then
       state.message = "Warning: low saturation"
-    elseif state.live.output < 1000 and state.setpoints.output > 0 then
-      state.message = "Attempting output bootstrap"
     else
       state.message = "Auto regulating"
     end
+    return
+  end
+
+  if isStoppingLike(info.status) then
+    local inTarget = inputPI(info)
+    local outTarget = math.max(state.setpoints.output, info.generationRate or 0)
+    applyInputSetpoint(inTarget)
+    applyOutputSetpoint(outTarget)
+    state.message = "Controlled shutdown"
     return
   end
 
@@ -927,17 +904,17 @@ local function drawMainPage()
   writeAt(3, h - 4, state.message:sub(1, w - 4), colors.lightGray, colors.black)
 
   local gap = 1
-  local bw = math.max(8, math.floor((w - 9) / 5))
+  local bw = math.max(10, math.floor((w - 7) / 4))
   local x1 = 1
   local x2 = x1 + bw + gap
   local x3 = x2 + bw + gap
   local x4 = x3 + bw + gap
-  local x5 = x4 + bw + gap
   local by = h - 1
 
   addButton(x1, by - 1, bw, 2, "CHARGE", colors.orange, colors.black, function()
     state.scrammed = false
     resetPID()
+    resetStartup()
     reactorCharge()
     state.message = "Charge command sent"
   end)
@@ -945,6 +922,9 @@ local function drawMainPage()
   addButton(x2, by - 1, bw, 2, "ACTIVATE", colors.lime, colors.black, function()
     state.scrammed = false
     resetPID()
+    state.startup.armed = true
+    state.startup.stableSince = nil
+    applyOutputSetpoint(0)
     reactorActivate()
     state.message = "Activate command sent"
   end)
@@ -959,13 +939,8 @@ local function drawMainPage()
     end
   end)
 
-  addButton(x4, by - 1, bw, 2, "KICK", colors.yellow, colors.black, function()
-    forceBootstrapOutput()
-  end)
-
-  addButton(x5, by - 1, bw, 2, "TUNING", colors.blue, colors.white, function()
+  addButton(x4, by - 1, bw, 2, "TUNING", colors.blue, colors.white, function()
     state.page = "tune"
-    state.tunePage = 1
     state.message = "Tuning page"
   end)
 end
@@ -985,49 +960,15 @@ local function drawTuneButtons(y, buttons, startX)
   end
 end
 
-local function drawTuneHeader(title)
+local function drawTunePage()
+  clearFrame(colors.black)
   local w, h = screen.w, screen.h
-  writeAt(1, 1, centerText(w, title), colors.white, colors.blue)
-  drawBox(1, 3, w, h - 6, "SETTINGS", colors.lightGray, colors.black, colors.white)
-end
 
-local function drawTuneFooter()
-  local h = screen.h
-  addButton(2, h - 2, 8, 2, "HOME", colors.blue, colors.white, function()
-    state.page = "main"
-    state.message = "Back to main"
-  end)
+  writeAt(1, 1, centerText(w, "TUNING"), colors.white, colors.blue)
+  drawBox(1, 3, w, h - 6, "TARGETS", colors.lightGray, colors.black, colors.white)
 
-  addButton(12, h - 2, 8, 2, "SAVE", colors.green, colors.black, function()
-    saveSettings(true)
-    state.message = "Settings saved"
-  end)
-
-  addButton(22, h - 2, 10, 2, "UNSCRAM", colors.orange, colors.black, function()
-    state.scrammed = false
-    resetPID()
-    state.message = "SCRAM latch cleared"
-  end)
-
-  if state.tunePage == 1 then
-    addButton(34, h - 2, 8, 2, "NEXT", colors.lightBlue, colors.black, function()
-      state.tunePage = 2
-      state.message = "Controller tuning"
-    end)
-  else
-    addButton(34, h - 2, 8, 2, "PREV", colors.lightBlue, colors.black, function()
-      state.tunePage = 1
-      state.message = "Target tuning"
-    end)
-  end
-end
-
-local function drawTunePage1()
-  local w = screen.w
-  drawTuneHeader("TUNING - TARGETS")
-
-  writeAt(3, 4, "Adjust operating targets and bootstrap-related main settings.", colors.white, colors.black)
-  writeAt(3, 5, "Recommended aggressive baseline: Temp 7800 / Field 55 / Sat 35", colors.lightGray, colors.black)
+  writeAt(3, 4, "Adjust reactor targets only.", colors.white, colors.black)
+  writeAt(3, 5, "Suggested safe starting point: Temp 7800 / Field 60 / Sat 50 / Output 20M", colors.lightGray, colors.black)
 
   writeAt(3, 7,  "Temp Target:", colors.lightGray, colors.black)
   writeAt(18, 7, tostring(settings.targets.temp), colors.orange, colors.black)
@@ -1054,7 +995,7 @@ local function drawTunePage1()
     { label = "+5", fn = function() adjustSetting("targets", "sat",  5, 5, 95) end, bg = colors.lightGray, fg = colors.black },
   })
 
-  writeAt(3, 16, "Output Cap:", colors.lightGray, colors.black)
+  writeAt(3, 16, "Output Target:", colors.lightGray, colors.black)
   writeAt(18,16, fmtRF(settings.targets.output), colors.yellow, colors.black)
   drawTuneButtons(17, {
     { label = "-50k", fn = function() adjustSetting("targets", "output", -50000, 0, 10000000000) end },
@@ -1069,116 +1010,22 @@ local function drawTunePage1()
     { label = "+1B",   fn = function() adjustSetting("targets", "output",  1000000000, 0, 10000000000) end, bg = colors.yellow, fg = colors.black },
   })
 
-  writeAt(3, 20, "Charge Flow:", colors.lightGray, colors.black)
-  writeAt(18,20, fmtRF(settings.control.chargeFlow), colors.orange, colors.black)
-  drawTuneButtons(21, {
-    { label = "-1M",  fn = function() adjustSetting("control", "chargeFlow", -1000000, 100000, 5000000000) end },
-    { label = "+1M",  fn = function() adjustSetting("control", "chargeFlow",  1000000, 100000, 5000000000) end },
-    { label = "-10M", fn = function() adjustSetting("control", "chargeFlow", -10000000, 100000, 5000000000) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+10M", fn = function() adjustSetting("control", "chargeFlow",  10000000, 100000, 5000000000) end, bg = colors.lightGray, fg = colors.black },
-  })
+  addButton(2, h - 2, 10, 2, "HOME", colors.blue, colors.white, function()
+    state.page = "main"
+    state.message = "Back to main"
+  end)
 
-  drawTuneFooter()
-end
+  addButton(14, h - 2, 10, 2, "SAVE", colors.green, colors.black, function()
+    saveSettings(true)
+    state.message = "Settings saved"
+  end)
 
-local function drawTunePage2()
-  drawTuneHeader("TUNING - CONTROLLER")
-
-  writeAt(3, 4, "Controller gains and bootstrap behavior.", colors.white, colors.black)
-  writeAt(3, 5, "Small changes are best. Save after each adjustment you like.", colors.lightGray, colors.black)
-
-  writeAt(3, 7, "In Kp:", colors.lightGray, colors.black)
-  writeAt(12,7, fmtNum(settings.control.inKp), colors.cyan, colors.black)
-  drawTuneButtons(8, {
-    { label = "-0.01", fn = function() adjustSetting("control", "inKp", -0.01, 0.01, 5.00) end },
-    { label = "+0.01", fn = function() adjustSetting("control", "inKp",  0.01, 0.01, 5.00) end },
-    { label = "-0.05", fn = function() adjustSetting("control", "inKp", -0.05, 0.01, 5.00) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+0.05", fn = function() adjustSetting("control", "inKp",  0.05, 0.01, 5.00) end, bg = colors.lightGray, fg = colors.black },
-  })
-
-  writeAt(3, 10, "In Ki:", colors.lightGray, colors.black)
-  writeAt(12,10, fmtNum(settings.control.inKi), colors.cyan, colors.black)
-  drawTuneButtons(11, {
-    { label = "-0.001", fn = function() adjustSetting("control", "inKi", -0.001, 0.000, 1.000) end },
-    { label = "+0.001", fn = function() adjustSetting("control", "inKi",  0.001, 0.000, 1.000) end },
-    { label = "-0.005", fn = function() adjustSetting("control", "inKi", -0.005, 0.000, 1.000) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+0.005", fn = function() adjustSetting("control", "inKi",  0.005, 0.000, 1.000) end, bg = colors.lightGray, fg = colors.black },
-  })
-
-  writeAt(3, 13, "Out Kp:", colors.lightGray, colors.black)
-  writeAt(12,13, fmtNum(settings.control.outKp), colors.yellow, colors.black)
-  drawTuneButtons(14, {
-    { label = "-0.005", fn = function() adjustSetting("control", "outKp", -0.005, 0.001, 5.000) end },
-    { label = "+0.005", fn = function() adjustSetting("control", "outKp",  0.005, 0.001, 5.000) end },
-    { label = "-0.02",  fn = function() adjustSetting("control", "outKp", -0.02,  0.001, 5.000) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+0.02",  fn = function() adjustSetting("control", "outKp",  0.02,  0.001, 5.000) end, bg = colors.lightGray, fg = colors.black },
-  })
-
-  writeAt(3, 16, "Out Ki:", colors.lightGray, colors.black)
-  writeAt(12,16, fmtNum(settings.control.outKi), colors.yellow, colors.black)
-  drawTuneButtons(17, {
-    { label = "-0.001", fn = function() adjustSetting("control", "outKi", -0.001, 0.000, 1.000) end },
-    { label = "+0.001", fn = function() adjustSetting("control", "outKi",  0.001, 0.000, 1.000) end },
-    { label = "-0.005", fn = function() adjustSetting("control", "outKi", -0.005, 0.000, 1.000) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+0.005", fn = function() adjustSetting("control", "outKi",  0.005, 0.000, 1.000) end, bg = colors.lightGray, fg = colors.black },
-  })
-
-  writeAt(34, 7, "In Up:", colors.lightGray, colors.black)
-  writeAt(43, 7, fmtRF(settings.control.inSlewUp), colors.cyan, colors.black)
-  drawTuneButtons(8, {
-    { label = "-500k", fn = function() adjustSetting("control", "inSlewUp", -500000, 10000, 500000000) end },
-    { label = "+500k", fn = function() adjustSetting("control", "inSlewUp",  500000, 10000, 500000000) end },
-  }, 34)
-
-  writeAt(34,10, "In Dn:", colors.lightGray, colors.black)
-  writeAt(43,10, fmtRF(settings.control.inSlewDown), colors.cyan, colors.black)
-  drawTuneButtons(11, {
-    { label = "-500k", fn = function() adjustSetting("control", "inSlewDown", -500000, 10000, 500000000) end },
-    { label = "+500k", fn = function() adjustSetting("control", "inSlewDown",  500000, 10000, 500000000) end },
-  }, 34)
-
-  writeAt(34,13, "Out Up:", colors.lightGray, colors.black)
-  writeAt(44,13, fmtRF(settings.control.outSlewUp), colors.yellow, colors.black)
-  drawTuneButtons(14, {
-    { label = "-1M", fn = function() adjustSetting("control", "outSlewUp", -1000000, 10000, 1000000000) end },
-    { label = "+1M", fn = function() adjustSetting("control", "outSlewUp",  1000000, 10000, 1000000000) end },
-  }, 34)
-
-  writeAt(34,16, "Out Dn:", colors.lightGray, colors.black)
-  writeAt(44,16, fmtRF(settings.control.outSlewDown), colors.yellow, colors.black)
-  drawTuneButtons(17, {
-    { label = "-1M", fn = function() adjustSetting("control", "outSlewDown", -1000000, 10000, 1000000000) end },
-    { label = "+1M", fn = function() adjustSetting("control", "outSlewDown",  1000000, 10000, 1000000000) end },
-  }, 34)
-
-  writeAt(3, 20, "Boot Min:", colors.lightGray, colors.black)
-  writeAt(14,20, fmtRF(settings.control.bootstrapMinOutput), colors.orange, colors.black)
-  drawTuneButtons(21, {
-    { label = "-100k", fn = function() adjustSetting("control", "bootstrapMinOutput", -100000, 0, 1000000000) end },
-    { label = "+100k", fn = function() adjustSetting("control", "bootstrapMinOutput",  100000, 0, 1000000000) end },
-    { label = "-1M", fn = function() adjustSetting("control", "bootstrapMinOutput", -1000000, 0, 1000000000) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+1M", fn = function() adjustSetting("control", "bootstrapMinOutput",  1000000, 0, 1000000000) end, bg = colors.lightGray, fg = colors.black },
-  })
-
-  writeAt(34,20, "Delay:", colors.lightGray, colors.black)
-  writeAt(42,20, fmtNum(settings.control.bootstrapDelay), colors.orange, colors.black)
-  drawTuneButtons(21, {
-    { label = "-0.5", fn = function() adjustSetting("control", "bootstrapDelay", -0.5, 0.0, 30.0) end },
-    { label = "+0.5", fn = function() adjustSetting("control", "bootstrapDelay",  0.5, 0.0, 30.0) end },
-    { label = "-2", fn = function() adjustSetting("control", "bootstrapDelay", -2.0, 0.0, 30.0) end, bg = colors.lightGray, fg = colors.black },
-    { label = "+2", fn = function() adjustSetting("control", "bootstrapDelay",  2.0, 0.0, 30.0) end, bg = colors.lightGray, fg = colors.black },
-  }, 50)
-
-  drawTuneFooter()
-end
-
-local function drawTunePage()
-  clearFrame(colors.black)
-  if state.tunePage == 1 then
-    drawTunePage1()
-  else
-    drawTunePage2()
-  end
+  addButton(26, h - 2, 12, 2, "UNSCRAM", colors.orange, colors.black, function()
+    state.scrammed = false
+    resetPID()
+    resetStartup()
+    state.message = "SCRAM latch cleared"
+  end)
 end
 
 local function render()
