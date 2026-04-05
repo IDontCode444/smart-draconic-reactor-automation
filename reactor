@@ -1,5 +1,5 @@
 -- Draconic Reactor Controller for CC:Tweaked
--- Simplified + fixed CHARGE state handling
+-- Safe startup version with strict zero-output hold and controlled ramp
 --
 -- Named peripherals:
 --   reactor:     draconic_reactor_0
@@ -49,12 +49,20 @@ local defaults = {
 
     chargeFlow       = 8000000,
 
+    -- Startup protection
     startupHoldTemp         = 2500,
-    startupReleaseFieldPct  = 45,
-    startupReleaseSatPct    = 85,
-    startupMinStableSeconds = 3.0,
-    startupOutputCap        = 1000000,
+    startupReleaseFieldPct  = 50,
+    startupReleaseSatPct    = 90,
+    startupStableSeconds    = 5.0,
+    startupZeroSecondsMin   = 6.0,
 
+    -- Output ramp after startup release
+    startupRampBegin        = 100000,   -- 100k rf/t
+    startupRampPerSecond    = 250000,   -- +250k rf/t per second
+    startupRampMax          = 5000000,  -- cap ramp phase at 5M before normal control fully takes over
+    startupRampDoneTemp     = 4500,     -- once hotter than this and stable, normal control can fully engage
+
+    -- input PI
     inKp = 0.20,
     inKi = 0.008,
     inIntegralMin = -50000000,
@@ -62,11 +70,12 @@ local defaults = {
     inSlewUp      = 2500000,
     inSlewDown    = 3500000,
 
+    -- output PI
     outKp = 0.050,
     outKi = 0.002,
     outIntegralMin = -1000000000,
     outIntegralMax =  1000000000,
-    outSlewUp      = 2000000,
+    outSlewUp      = 1000000,
     outSlewDown    = 12000000,
   }
 }
@@ -106,7 +115,10 @@ local state = {
   prevStatus = "unknown",
 
   startup = {
+    activateAt = nil,
     stableSince = nil,
+    rampStartAt = nil,
+    phase = "none", -- none / zero_hold / ramp
   }
 }
 
@@ -193,7 +205,10 @@ local function resetPID()
 end
 
 local function resetStartup()
+  state.startup.activateAt = nil
   state.startup.stableSince = nil
+  state.startup.rampStartAt = nil
+  state.startup.phase = "none"
 end
 
 -------------------------
@@ -475,11 +490,11 @@ local function inputPI(info)
   )
 end
 
-local function outputPI(info)
+local function outputPI(info, capOverride)
   local tempTarget = clamp(settings.targets.temp, 2500, 8000)
   local satTarget = clamp(settings.targets.sat, 5, 95)
   local fieldTarget = clamp(settings.targets.field, 20, 80)
-  local outCap = math.max(0, settings.targets.output)
+  local outCap = math.max(0, capOverride or settings.targets.output)
 
   local tempErr = (tempTarget - info.temperature) / 100
   local satErr  = (info.satPct - satTarget) * 2.0
@@ -535,6 +550,15 @@ local function startupStable(info)
   return info.temperature >= settings.control.startupHoldTemp
     and info.fieldPct >= settings.control.startupReleaseFieldPct
     and info.satPct >= settings.control.startupReleaseSatPct
+end
+
+local function startupRampCap()
+  if not state.startup.rampStartAt then
+    return 0
+  end
+  local elapsed = math.max(0, os.clock() - state.startup.rampStartAt)
+  local cap = settings.control.startupRampBegin + (elapsed * settings.control.startupRampPerSecond)
+  return clamp(cap, 0, math.min(settings.targets.output, settings.control.startupRampMax))
 end
 
 local function hardScram(info, why)
@@ -604,58 +628,67 @@ local function controlTick()
     return
   end
 
-  -- Explicit charging mode
   if state.mode == "charging" then
     local ready = (info.fieldPct >= 50) and (info.satPct >= 50) and (info.temperature >= 2000)
 
-    if ready or isChargingLike(info.status) then
-      applyOutputSetpoint(0)
-      if ready then
-        applyInputSetpoint(0)
-        state.message = "Charge complete - ready to activate"
-      else
-        applyInputSetpoint(settings.control.chargeFlow)
-        state.message = "Charging reactor"
-      end
+    applyOutputSetpoint(0)
+
+    if ready then
+      applyInputSetpoint(0)
+      state.message = "Charge complete - ready to activate"
     else
-      -- stay charging even if status still says cold
-      applyOutputSetpoint(0)
       applyInputSetpoint(settings.control.chargeFlow)
       state.message = "Charging reactor"
     end
     return
   end
 
-  -- Explicit startup mode after activate
   if state.mode == "starting" then
     local inTarget = inputPI(info)
     applyInputSetpoint(inTarget)
 
-    if startupStable(info) then
-      if not state.startup.stableSince then
-        state.startup.stableSince = os.clock()
-      end
-    else
-      state.startup.stableSince = nil
-    end
+    -- Phase 1: strict zero output
+    if state.startup.phase == "zero_hold" then
+      applyOutputSetpoint(0)
 
-    local startupReleased = state.startup.stableSince
-      and (os.clock() - state.startup.stableSince) >= settings.control.startupMinStableSeconds
+      local zeroElapsed = state.startup.activateAt and (os.clock() - state.startup.activateAt) or 0
 
-    if not startupReleased then
-      if info.temperature < settings.control.startupHoldTemp then
-        applyOutputSetpoint(0)
-        state.message = "Startup hold: warming reactor"
+      if startupStable(info) then
+        if not state.startup.stableSince then
+          state.startup.stableSince = os.clock()
+        end
       else
-        applyOutputSetpoint(math.min(settings.control.startupOutputCap, settings.targets.output))
-        state.message = "Startup hold: gentle output ramp"
+        state.startup.stableSince = nil
+      end
+
+      local stableEnough = state.startup.stableSince and ((os.clock() - state.startup.stableSince) >= settings.control.startupStableSeconds)
+      local zeroLongEnough = zeroElapsed >= settings.control.startupZeroSecondsMin
+
+      if stableEnough and zeroLongEnough then
+        state.startup.phase = "ramp"
+        state.startup.rampStartAt = os.clock()
+        state.message = "Startup ramp beginning"
+      else
+        state.message = "Startup hold: zero output"
       end
       return
     end
 
-    state.mode = "running"
-    state.message = "Startup complete"
-    return
+    -- Phase 2: controlled small ramp
+    if state.startup.phase == "ramp" then
+      local rampCap = startupRampCap()
+      local outTarget = outputPI(info, rampCap)
+      applyOutputSetpoint(outTarget)
+
+      -- Keep input actively controlled
+      if info.temperature >= settings.control.startupRampDoneTemp and rampCap >= math.min(settings.targets.output, settings.control.startupRampMax) then
+        state.mode = "running"
+        state.message = "Startup complete"
+      else
+        state.message = "Startup ramp: " .. fmtRF(rampCap) .. " max"
+      end
+      return
+    end
   end
 
   if isStoppingLike(info.status) then
@@ -688,7 +721,6 @@ local function controlTick()
     return
   end
 
-  -- Idle behavior
   if isColdLike(info.status) then
     applyInputSetpoint(0)
     applyOutputSetpoint(0)
@@ -929,6 +961,8 @@ local function drawMainPage()
     state.mode = "starting"
     resetPID()
     resetStartup()
+    state.startup.activateAt = os.clock()
+    state.startup.phase = "zero_hold"
     applyOutputSetpoint(0)
     reactorActivate()
     state.message = "Activate command sent"
